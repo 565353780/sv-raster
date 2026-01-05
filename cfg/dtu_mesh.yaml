@@ -1,0 +1,32 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+# See `src/config.py` for the base setup.
+data:
+  eval: False
+  skip_blend_alpha: True
+  res_downscale: 2.0
+
+bounding:
+  outside_level: 1
+
+model:
+  n_samp_per_vox: 3
+  black_background: True
+
+optimizer:
+  geo_lr: 0.05
+
+regularizer:
+  lambda_T_concen: 0.01
+  lambda_R_concen: 0.1
+  lambda_normal_dmean: 0.001
+  lambda_normal_dmed: 0.001
+
+init:
+  init_out_ratio: 0.01  # Use very few voxels for the mostly black background
