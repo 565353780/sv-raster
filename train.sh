@@ -9,3 +9,6 @@ python train.py \
   --lambda_normal_dmean 0.001 \
   --lambda_ascending 0.01 \
   --lambda_sparse_depth 0.01
+
+python extract_mesh.py \
+  ${DATA_FOLDER}/svraster/
