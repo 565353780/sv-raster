@@ -14,7 +14,6 @@ import numpy as np
 import torch
 
 from src.dataloader.reader_colmap_dataset import read_colmap_dataset
-from src.dataloader.reader_nerf_dataset import read_nerf_dataset
 from src.utils.camera_utils import interpolate_poses
 
 from src.cameras import Camera, MiniCam
@@ -46,8 +45,6 @@ class DataPack:
 
         sparse_path = os.path.join(source_path, "sparse")
         colmap_path = os.path.join(source_path, "colmap", "sparse")
-        meta_path1 = os.path.join(source_path, "transforms_train.json")
-        meta_path2 = os.path.join(source_path, "transforms.json")
 
         # Read images concurrently
         s_time = time.perf_counter()
@@ -58,15 +55,6 @@ class DataPack:
                 source_path=source_path,
                 image_dir_name=image_dir_name,
                 mask_dir_name=mask_dir_name,
-                use_test=use_test,
-                test_every=test_every,
-                camera_creator=camera_creator)
-        elif os.path.exists(meta_path1) or os.path.exists(meta_path2):
-            print("Read dataset in NeRF format.")
-            dataset = read_nerf_dataset(
-                source_path=source_path,
-                use_test=use_test,
-                test_every=test_every,
                 camera_creator=camera_creator)
         else:
             raise Exception("Unknown scene type!")

@@ -8,18 +8,22 @@
 
 import os
 import json
+import trimesh
 import natsort
-import pycolmap
 import numpy as np
 from PIL import Image
 from pathlib import Path
 import concurrent.futures
 
-from src.utils.colmap_utils import parse_colmap_pts
+from src.utils.colmap_utils import (
+    read_extrinsics_text,
+    read_intrinsics_text,
+    qvec2rotmat
+)
 from src.utils.camera_utils import focal2fov
 
 
-def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, test_every, camera_creator):
+def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, camera_creator):
 
     source_path = Path(source_path)
 
@@ -30,20 +34,35 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
     if not sparse_path.exists():
         raise Exception("Can not find COLMAP reconstruction.")
 
-    sfm = pycolmap.Reconstruction(sparse_path)
-    point_cloud = parse_colmap_pts(sfm)
-    correspondent = point_cloud.corr
+    # Read cameras (intrinsics)
+    cameras_txt_file = sparse_path / "cameras.txt"
+    if cameras_txt_file.exists():
+        cam_intrinsics = read_intrinsics_text(str(cameras_txt_file))
+    else:
+        raise Exception(f"Can not find cameras file in {sparse_path}")
+
+    # Read images (extrinsics)
+    images_txt_file = sparse_path / "images.txt"
+    if images_txt_file.exists():
+        cam_extrinsics = read_extrinsics_text(str(images_txt_file))
+    else:
+        raise Exception(f"Can not find images file in {sparse_path}")
+
+    # Read 3D points
+    pcd = trimesh.load(sparse_path / "points3D.ply")
+    point_cloud = pcd.vertices
 
     # Sort key by filename
     keys = natsort.natsorted(
-        sfm.images.keys(),
-        key = lambda k : sfm.images[k].name)
+        cam_extrinsics.keys(),
+        key=lambda k: cam_extrinsics[k].name)
 
     # Load all images and cameras
     todo_lst = []
     for key in keys:
 
-        frame = sfm.images[key]
+        frame = cam_extrinsics[key]
+        intr = cam_intrinsics[frame.camera_id]
 
         # Load image
         image_path = source_path / image_dir_name / frame.name
@@ -58,31 +77,34 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
         image = Image.open(image_path)
 
         # Load camera intrinsic
-        if frame.camera.model.name == "SIMPLE_PINHOLE":
-            focal_x, cx, cy = frame.camera.params
-            fovx = focal2fov(focal_x, frame.camera.width)
-            fovy = focal2fov(focal_x, frame.camera.height)
-            cx_p = cx / frame.camera.width
-            cy_p = cy / frame.camera.height
-        elif frame.camera.model.name == "PINHOLE":
-            focal_x, focal_y, cx, cy = frame.camera.params
-            fovx = focal2fov(focal_x, frame.camera.width)
-            fovy = focal2fov(focal_y, frame.camera.height)
-            cx_p = cx / frame.camera.width
-            cy_p = cy / frame.camera.height
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_x = intr.params[0]
+            cx = intr.params[1]
+            cy = intr.params[2]
+            fovx = focal2fov(focal_x, intr.width)
+            fovy = focal2fov(focal_x, intr.height)
+            cx_p = cx / intr.width
+            cy_p = cy / intr.height
+        elif intr.model == "PINHOLE":
+            focal_x = intr.params[0]
+            focal_y = intr.params[1]
+            cx = intr.params[2]
+            cy = intr.params[3]
+            fovx = focal2fov(focal_x, intr.width)
+            fovy = focal2fov(focal_y, intr.height)
+            cx_p = cx / intr.width
+            cy_p = cy / intr.height
         else:
             assert False, "Colmap camera model not handled: only undistorted datasets (PINHOLE or SIMPLE_PINHOLE cameras) supported!"
 
         # Load camera extrinsic
-        w2c = np.eye(4, dtype=np.float32)
-        try:
-            w2c[:3] = frame.cam_from_world().matrix()
-        except:
-            # Older version of pycolmap
-            w2c[:3] = frame.cam_from_world.matrix()
+        # Convert quaternion and translation to 4x4 world-to-camera matrix
+        R = qvec2rotmat(frame.qvec)  # 3x3 rotation matrix (camera to world rotation transposed)
+        T = frame.tvec  # translation vector
 
-        # Load sparse point
-        sparse_pt = point_cloud.points[correspondent[frame.name]]
+        w2c = np.eye(4, dtype=np.float32)
+        w2c[:3, :3] = R
+        w2c[:3, 3] = T
 
         # Load mask if there is
         mask_path = (source_path / mask_dir_name / frame.name).with_suffix('.png')
@@ -98,7 +120,6 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
             fovy=fovy,
             cx_p=cx_p,
             cy_p=cy_p,
-            sparse_pt=sparse_pt,
             image_name=image_path.name,
             mask=mask,
         ))
@@ -111,18 +132,6 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(camera_creator, **todo) for todo in todo_lst]
         cam_lst = [f.result() for f in futures]
-
-    # Split train/test
-    if use_test:
-        train_cam_lst = [
-            cam for i, cam in enumerate(cam_lst)
-            if i % test_every != 0]
-        test_cam_lst = [
-            cam for i, cam in enumerate(cam_lst)
-            if i % test_every == 0]
-    else:
-        train_cam_lst = cam_lst
-        test_cam_lst = []
 
     # Parse main scene bound if there is
     nerf_normalization_path = os.path.join(source_path, "nerf_normalization.json")
@@ -140,8 +149,8 @@ def read_colmap_dataset(source_path, image_dir_name, mask_dir_name, use_test, te
 
     # Pack dataset
     dataset = {
-        'train_cam_lst': train_cam_lst,
-        'test_cam_lst': test_cam_lst,
+        'train_cam_lst': cam_lst,
+        'test_cam_lst': [],
         'suggested_bounding': suggested_bounding,
         'point_cloud': point_cloud,
     }

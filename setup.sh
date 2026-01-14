@@ -14,6 +14,7 @@ pip install opencv-python==4.8.0.74
 pip install opencv-contrib-python==4.8.0.74
 pip install trimesh==4.0.4
 pip install open3d==0.18.0
+pip install numpy==1.26.4
 
 cd fused-ssim
 python setup.py install
