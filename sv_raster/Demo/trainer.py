@@ -4,6 +4,7 @@ sys.path.append('../../MATCH/camera-control')
 import os
 import cv2
 import pickle
+from tqdm import trange
 
 from sv_raster.Config.config import TrainerConfig, ModelConfig, ProcedureConfig, InitConfig
 from sv_raster.Module.trainer import Trainer
@@ -41,7 +42,7 @@ def demo():
             white_background=True,
         ),
         procedure=ProcedureConfig(
-            n_iter=1000,
+            n_iter=10000,
             seed=42,
         ),
         init=InitConfig(
@@ -70,9 +71,9 @@ def demo():
     output_folder = os.path.join(save_data_folder_path, "svraster", "render")
     os.makedirs(output_folder, exist_ok=True)
 
-    for i in range(len(camera_list)):
+    print(f"[INFO] start save concatenated image to {output_folder}")
+    for i in trange(len(camera_list)):
         render_image = trainer.render(camera_list[i], output_T=True, output_depth=True, output_normal=True)
         out_path = os.path.join(output_folder, f"{i:06d}.png")
         cv2.imwrite(out_path, render_image)
-        print(f"[INFO] Saved concatenated image to {out_path}")
     return trainer
