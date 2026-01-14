@@ -6,12 +6,12 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-from src.sparse_voxel_gears.constructor import SVConstructor
-from src.sparse_voxel_gears.properties import SVProperties
-from src.sparse_voxel_gears.renderer import SVRenderer
-from src.sparse_voxel_gears.adaptive import SVAdaptive
-from src.sparse_voxel_gears.io import SVInOut
-from src.sparse_voxel_gears.pooling import SVPooling
+from sv_raster.Model.sparse_voxel_gears.constructor import SVConstructor
+from sv_raster.Model.sparse_voxel_gears.properties import SVProperties
+from sv_raster.Model.sparse_voxel_gears.renderer import SVRenderer
+from sv_raster.Model.sparse_voxel_gears.adaptive import SVAdaptive
+from sv_raster.Model.sparse_voxel_gears.io import SVInOut
+from sv_raster.Model.sparse_voxel_gears.pooling import SVPooling
 
 
 class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVInOut, SVPooling):
@@ -27,10 +27,10 @@ class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVIn
         Setup of the model meta. At this point, no voxel is allocated.
         Use the following methods to allocate voxels and parameters.
 
-        1. `model_load` defined in `src/sparse_voxel_gears/io.py`.
+        1. `model_load` defined in `sv_raster.Model/sparse_voxel_gears/io.py`.
            Load the saved models from a given path.
 
-        2. `model_init` defined in `src/sparse_voxel_gears/constructor.py`.
+        2. `model_init` defined in `sv_raster.Model/sparse_voxel_gears/constructor.py`.
            Heuristically initial the sparse grid layout and parameters from the training datas.
         '''
         super().__init__()

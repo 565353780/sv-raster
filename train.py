@@ -17,8 +17,6 @@ from tqdm import tqdm
 
 import torch
 
-from src.config import cfg, update_argparser, update_config
-
 from src.utils.system_utils import seed_everything
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
 from src.utils.bounding_utils import decide_main_bounding
@@ -26,7 +24,9 @@ from src.utils import mono_utils
 from src.utils import loss_utils
 
 from src.dataloader.data_pack import DataPack, compute_iter_idx
-from src.sparse_voxel_model import SparseVoxelModel
+
+from sv_raster.Config.config import cfg, update_config
+from sv_raster.Model.sparse_voxel import SparseVoxelModel
 
 import svraster_cuda
 
