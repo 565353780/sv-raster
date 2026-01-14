@@ -1,34 +1,20 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
 import os
-import json
-import time
-import uuid
-import datetime
-import imageio
+import cv2
+import torch
+import trimesh
 import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
-from dataclasses import replace
 from typing import List, Optional, Union
 
-import torch
-import trimesh
-
 from camera_control.Module.rgbd_camera import RGBDCamera
-from camera_control.Method.data import toNumpy, toTensor
+
+import svraster_cuda
+from src.utils.image_utils import im_tensor2np, viz_tensordepth
 
 from sv_raster.Config.config import TrainerConfig, cfg
 from sv_raster.Method.io import loadMeshFile
 from sv_raster.Model.sparse_voxel import SparseVoxelModel
-
-import svraster_cuda
 
 
 class TrainingCamera:
@@ -88,14 +74,14 @@ class TrainingCamera:
         if self._w2c is None:
             # RGBDCamera 使用的坐标系：X右，Y上，Z后（相机看向-Z）
             # 需要转换为训练代码的坐标系
-            self._w2c = self.rgbd_camera.world2camera.float().cuda()
+            self._w2c = self.rgbd_camera.world2cameraColmap.float().cuda()
         return self._w2c
 
     @property
     def c2w(self) -> torch.Tensor:
         """相机到世界变换矩阵"""
         if self._c2w is None:
-            self._c2w = self.w2c.inverse().contiguous()
+            self._c2w = self.rgbd_camera.camera2worldColmap.float().cuda()
         return self._c2w
 
     @property
@@ -542,14 +528,12 @@ class Trainer:
 
     def train(
         self,
-        n_iter: Optional[int] = None,
         verbose: bool = True,
     ) -> bool:
         """
         执行训练
 
         Args:
-            n_iter: 迭代次数，如果为None则使用配置中的值
             verbose: 是否显示进度条
 
         Returns:
@@ -566,8 +550,7 @@ class Trainer:
                 return False
 
         cfg = self.config
-        if n_iter is None:
-            n_iter = cfg.procedure.n_iter
+        n_iter = cfg.procedure.n_iter
 
         # 初始化自动曝光
         if cfg.auto_exposure.enable:
@@ -866,7 +849,34 @@ class Trainer:
         if isinstance(camera, RGBDCamera):
             camera = TrainingCamera(camera)
 
-        return self.voxel_model.render(camera, **kwargs)
+        render_pkg = self.voxel_model.render(camera, **kwargs)
+
+        gt_rgb = camera.rgbd_camera.image_cv
+        render_rgb = im_tensor2np(render_pkg['color'].detach().clone())
+        render_alpha = im_tensor2np(1-render_pkg['T'].detach().clone())[...,None].repeat(3, axis=-1)
+        render_depth_med = viz_tensordepth(render_pkg['depth'][2].detach().clone())
+        render_depth = viz_tensordepth(render_pkg['depth'][0].detach().clone(), 1-render_pkg['T'][0].detach().clone())
+        render_normal = im_tensor2np(render_pkg['normal'].detach().clone() * 0.5 + 0.5)
+
+        imgs = [
+            gt_rgb, render_rgb,
+            render_alpha, render_depth_med,
+            render_depth, render_normal,
+        ]
+
+        # 保证shape一致
+        h, w = imgs[0].shape[:2]
+        imgs = [cv2.resize(img, (w, h)) if img.shape[:2] != (h, w) else img for img in imgs]
+
+        # 拼成3x2的大图
+        concated_image = np.concatenate(
+            [
+                np.concatenate(imgs[:2], axis=1),
+                np.concatenate(imgs[2:4], axis=1),
+                np.concatenate(imgs[4:6], axis=1),
+            ], axis=0,
+        )
+        return concated_image
 
     def save(
         self,

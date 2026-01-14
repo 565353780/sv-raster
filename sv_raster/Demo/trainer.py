@@ -2,6 +2,7 @@ import sys
 sys.path.append('../../MATCH/camera-control')
 
 import os
+import cv2
 import pickle
 
 from sv_raster.Config.config import TrainerConfig, ModelConfig, ProcedureConfig, InitConfig
@@ -40,11 +41,11 @@ def demo():
             white_background=True,
         ),
         procedure=ProcedureConfig(
-            n_iter=5000,
+            n_iter=1000,
             seed=42,
         ),
         init=InitConfig(
-            init_n_level=8,
+            init_n_level=6,
         ),
     )
 
@@ -53,7 +54,7 @@ def demo():
 
     # 加载 mesh（替换为实际的 mesh 文件路径）
     assert os.path.exists(gen_mesh_file_path)
-    trainer.loadMeshFile(gen_mesh_file_path, vox_level=8)
+    trainer.loadMeshFile(gen_mesh_file_path, vox_level=6)
 
     for i in range(len(camera_list)):
         trainer.addCamera(camera_list[i], is_test=False)
@@ -62,16 +63,16 @@ def demo():
     print(f"[INFO] Added {len(trainer.test_cameras)} test cameras")
 
     # 开始训练
-    trainer.train(n_iter=5000, verbose=True)
+    trainer.train(verbose=True)
 
     print("[INFO] Demo completed (training skipped for demo)")
 
-    for i in range(len(camera_list)):
-        render_result = trainer.render(camera_list[i], output_depth=True, output_normal=True)
-        print(f"[INFO] Rendered image shape: {render_result['color'].shape}")
+    output_folder = os.path.join(save_data_folder_path, "svraster", "render")
+    os.makedirs(output_folder, exist_ok=True)
 
-        if render_result['depth'] is not None:
-            print(f"[INFO] Rendered depth shape: {render_result['depth'].shape}")
-        if render_result['normal'] is not None:
-            print(f"[INFO] Rendered normal shape: {render_result['normal'].shape}")
+    for i in range(len(camera_list)):
+        render_image = trainer.render(camera_list[i], output_T=True, output_depth=True, output_normal=True)
+        out_path = os.path.join(output_folder, f"{i:06d}.png")
+        cv2.imwrite(out_path, render_image)
+        print(f"[INFO] Saved concatenated image to {out_path}")
     return trainer

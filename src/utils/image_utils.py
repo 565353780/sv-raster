@@ -7,7 +7,6 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-import os
 import cv2
 import torch
 import numpy as np
