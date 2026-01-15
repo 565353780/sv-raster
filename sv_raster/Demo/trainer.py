@@ -80,6 +80,6 @@ def demo():
     trainer.exportMeshFile(
         save_data_folder_path + "svraster/tsdf_mesh.ply",
         final_lv=16,
-        bbox_scale=1.0,
+        use_tsdf=True,
     )
     return trainer

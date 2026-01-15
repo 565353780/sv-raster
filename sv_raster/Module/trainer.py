@@ -742,7 +742,13 @@ class Trainer:
         save_mesh_file_path: str,
         final_lv: int = 10,
         bbox_scale: float = 1.0,
-        crop_bbox: Optional[np.ndarray] = None,
+        crop_bbox: Optional[torch.Tensor] = None,
+        use_tsdf: bool = False,
+        bandwidth_vox: float = 5.0,
+        crop_border: float = 0.01,
+        alpha_thres: float = 0.5,
+        use_mean: bool = False,
+        iso: float = 0.0,
     ) -> bool:
         """
         导出mesh文件
@@ -751,7 +757,13 @@ class Trainer:
             save_mesh_file_path: 保存mesh文件的路径
             final_lv: 用于marching cubes的最终层级
             bbox_scale: 边界框缩放因子
-            crop_bbox: 可选的裁剪边界框，形状为 [2, 3]，第一行是最小值，第二行是最大值
+            crop_bbox: 裁剪边界框 [min_xyz, max_xyz]，如果为None则自动计算
+            use_tsdf: 是否使用TSDF融合方法（更准确但更慢），False则使用直接marching cubes
+            bandwidth_vox: TSDF截断带宽（以voxel大小为单位）
+            crop_border: TSDF融合时裁剪边界比例
+            alpha_thres: TSDF融合时alpha阈值
+            use_mean: 是否使用平均深度（否则使用中值深度）
+            iso: marching cubes的iso值
 
         Returns:
             是否成功
@@ -761,57 +773,205 @@ class Trainer:
             print('\t Model not initialized. Please train or load a model first.')
             return False
 
-        createFileFolder(save_mesh_file_path)
+        if len(self.train_cameras) == 0:
+            print('[ERROR][Trainer::exportMeshFile]')
+            print('\t No training cameras available.')
+            return False
 
-        # 冻结几何参数
+        # 冻结voxel几何
         self.voxel_model.freeze_vox_geo()
 
-        # 确定边界框
+        if use_tsdf:
+            # 使用TSDF融合方法
+            mesh = self._extract_mesh_tsdf(
+                final_lv=final_lv,
+                bbox_scale=bbox_scale,
+                crop_bbox=crop_bbox,
+                bandwidth_vox=bandwidth_vox,
+                crop_border=crop_border,
+                alpha_thres=alpha_thres,
+                use_mean=use_mean,
+                iso=iso,
+            )
+        else:
+            # 使用直接marching cubes方法
+            mesh = self._extract_mesh_direct(
+                final_lv=final_lv,
+                bbox_scale=bbox_scale,
+                crop_bbox=crop_bbox,
+                iso=iso,
+            )
+
+        # 保存mesh
+        createFileFolder(save_mesh_file_path)
+        mesh.export(save_mesh_file_path)
+        print(f'[INFO] Exported mesh to {save_mesh_file_path}')
+
+        # 解冻voxel几何
+        self.voxel_model.unfreeze_vox_geo()
+
+        return True
+
+    @torch.no_grad()
+    def _extract_mesh_direct(
+        self,
+        final_lv: int,
+        bbox_scale: float,
+        crop_bbox: Optional[torch.Tensor],
+        iso: float,
+    ) -> trimesh.Trimesh:
+        """使用直接marching cubes方法提取mesh"""
+        # 过滤背景voxels
         if crop_bbox is None:
             inside_min = self.voxel_model.scene_center - 0.5 * self.voxel_model.inside_extent * bbox_scale
             inside_max = self.voxel_model.scene_center + 0.5 * self.voxel_model.inside_extent * bbox_scale
         else:
-            inside_min = torch.tensor(crop_bbox[0], dtype=torch.float32, device="cuda")
-            inside_max = torch.tensor(crop_bbox[1], dtype=torch.float32, device="cuda")
+            inside_min = crop_bbox[0].cuda() if not crop_bbox[0].is_cuda else crop_bbox[0]
+            inside_max = crop_bbox[1].cuda() if not crop_bbox[1].is_cuda else crop_bbox[1]
 
-        # 过滤背景voxel
         inside_mask = ((inside_min <= self.voxel_model.grid_pts_xyz) & 
-                        (self.voxel_model.grid_pts_xyz <= inside_max)).all(-1)
+                      (self.voxel_model.grid_pts_xyz <= inside_max)).all(-1)
         inside_mask = inside_mask[self.voxel_model.vox_key].any(-1)
         inside_idx = torch.where(inside_mask)[0]
 
-        # Infer iso value for level set
+        # 推断iso值用于level set
         vox_level = torch.tensor([self.voxel_model.outside_level + final_lv], device="cuda")
         vox_size = octree_utils.level_2_vox_size(self.voxel_model.scene_extent, vox_level).item()
         iso_alpha = torch.tensor(0.5, device="cuda")
         iso_density = activation_utils.alpha2density(iso_alpha, vox_size)
         
-        # Get density_mode, default to EXP_LINEAR_11 if not present
-        # According to CUDA code, density_mode is always EXP_LINEAR_11_MODE
-        density_mode = getattr(self.voxel_model, 'density_mode', 'EXP_LINEAR_11_MODE')
-        # Remove _MODE suffix if present and convert to lowercase
-        if density_mode.endswith('_MODE'):
-            density_mode = density_mode[:-5]
-        density_mode = density_mode.lower()
-        iso = getattr(activation_utils, f"{density_mode}_inverse")(iso_density)
-
+        # 尝试获取density_mode，如果不存在则使用默认的softplus
+        if hasattr(self.voxel_model, 'density_mode'):
+            density_inverse = getattr(activation_utils, f"{self.voxel_model.density_mode}_inverse", 
+                                    activation_utils.softplus_inverse)
+        else:
+            density_inverse = activation_utils.softplus_inverse
+        
+        iso_value = density_inverse(iso_density)
         sign = -1
 
-        # 执行marching cubes
+        # 如果用户指定了iso值，则使用用户的值，否则使用计算出的iso_value
+        final_iso = iso if iso != 0.0 else iso_value
+
+        # 提取mesh
         verts, faces = torch_marching_cubes_grid(
             grid_pts_val=sign * self.voxel_model._geo_grid_pts,
             grid_pts_xyz=self.voxel_model.grid_pts_xyz,
             vox_key=self.voxel_model.vox_key[inside_idx],
-            iso=sign * iso)
+            iso=sign * final_iso)
 
-        # 创建trimesh对象
         mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
+        return mesh
 
-        # 导出mesh
-        mesh.export(save_mesh_file_path)
-        print(f"[EXPORT] Mesh saved to {save_mesh_file_path}")
-        print(f"[EXPORT] Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+    @torch.no_grad()
+    def _extract_mesh_tsdf(
+        self,
+        final_lv: int,
+        bbox_scale: float,
+        crop_bbox: Optional[torch.Tensor],
+        bandwidth_vox: float,
+        crop_border: float,
+        alpha_thres: float,
+        use_mean: bool,
+        iso: float,
+    ) -> trimesh.Trimesh:
+        """使用TSDF融合方法提取mesh"""
+        from src.utils.fuser_utils import Fuser
 
-        # 解冻几何参数
-        self.voxel_model.unfreeze_vox_geo()
-        return True
+        # 渲染所有训练视图的深度和alpha
+        depth_lst = []
+        alpha_lst = []
+        for cam in tqdm(self.train_cameras, desc="Render training views"):
+            render_pkg = self.voxel_model.render(cam, output_depth=True, output_T=True)
+            if use_mean:
+                frame_depth = render_pkg['raw_depth'][[0]]  # 使用平均深度
+            else:
+                frame_depth = render_pkg['raw_depth'][[2]]  # 使用中值深度
+            frame_alpha = 1 - render_pkg['raw_T']
+            depth_lst.append(frame_depth)
+            alpha_lst.append(frame_alpha)
+
+        # 过滤背景voxels
+        if crop_bbox is None:
+            inside_min = self.voxel_model.scene_center - 0.5 * self.voxel_model.inside_extent * bbox_scale
+            inside_max = self.voxel_model.scene_center + 0.5 * self.voxel_model.inside_extent * bbox_scale
+        else:
+            inside_min = crop_bbox[0].cuda() if not crop_bbox[0].is_cuda else crop_bbox[0]
+            inside_max = crop_bbox[1].cuda() if not crop_bbox[1].is_cuda else crop_bbox[1]
+
+        # 限制层级
+        target_lv = self.voxel_model.outside_level + final_lv
+        octpath, octlevel = octree_utils.clamp_level(
+            self.voxel_model.octpath, self.voxel_model.octlevel, target_lv)
+
+        # 从限制后的自适应稀疏voxels初始化
+        vol = SparseVoxelModel(sh_degree=0)
+        vol.octpath_init(
+            self.voxel_model.scene_center,
+            self.voxel_model.scene_extent,
+            octpath,
+            octlevel,
+        )
+
+        # 剪枝外部voxel
+        gridpts_outside = ((vol.grid_pts_xyz < inside_min) | (vol.grid_pts_xyz > inside_max)).any(-1)
+        corners_outside = gridpts_outside[vol.vox_key]
+        prune_mask = corners_outside.all(-1)
+        vol.pruning(prune_mask)
+
+        # 确定带宽
+        bandwidth = bandwidth_vox * vol.vox_size.min().item()
+
+        # 运行TSDF融合
+        print(f"Running TSDF fusion: #voxels={vol.num_voxels:9d} / band={bandwidth}")
+        grid_tsdf = self._tsdf_fusion(
+            self.train_cameras, depth_lst, alpha_lst,
+            vol.grid_pts_xyz, bandwidth, crop_border, alpha_thres)
+
+        # 从grid提取mesh
+        verts, faces = torch_marching_cubes_grid(
+            grid_pts_val=grid_tsdf,
+            grid_pts_xyz=vol.grid_pts_xyz,
+            vox_key=vol.vox_key,
+            iso=iso)
+
+        mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
+        return mesh
+
+    @torch.no_grad()
+    def _tsdf_fusion(
+        self,
+        cam_lst: List[ColmapCamera],
+        depth_lst: List[torch.Tensor],
+        alpha_lst: List[torch.Tensor],
+        grid_pts_xyz: torch.Tensor,
+        trunc_dist: float,
+        crop_border: float,
+        alpha_thres: float,
+    ) -> torch.Tensor:
+        """执行TSDF融合"""
+        from src.utils.fuser_utils import Fuser
+
+        assert len(cam_lst) == len(depth_lst)
+        assert len(cam_lst) == len(alpha_lst)
+
+        fuser = Fuser(
+            xyz=grid_pts_xyz,
+            bandwidth=trunc_dist,
+            use_trunc=True,
+            fuse_tsdf=True,
+            feat_dim=0,
+            alpha_thres=alpha_thres,
+            crop_border=crop_border,
+            normal_weight=False,
+            depth_weight=False,
+            border_weight=False,
+            use_half=False)
+
+        for cam, frame_depth, frame_alpha in zip(tqdm(cam_lst), depth_lst, alpha_lst):
+            frame_depth = frame_depth.cuda()
+            frame_alpha = frame_alpha.cuda()
+            fuser.integrate(cam, frame_depth, alpha=frame_alpha)
+
+        tsdf = fuser.tsdf.squeeze(1).contiguous()
+        return tsdf
