@@ -16,7 +16,6 @@ import svraster_cuda
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
 from src.utils import octree_utils
 from src.utils import activation_utils
-from src.utils.marching_cubes_utils import torch_marching_cubes_grid
 
 from sv_raster.Config.config import TrainerConfig, cfg
 from sv_raster.Data.colmap_camera import ColmapCamera
@@ -675,67 +674,13 @@ class Trainer:
         if cfg.regularizer.lambda_ge_density and grid_eikonal_interval:
             lambda_ge_mult = cfg.regularizer.ge_decay_mult ** min(iteration // cfg.regularizer.ge_decay_every, 2)
             G = self.voxel_model.grid_keys.numel()
-            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
-            active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
-            max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
-            vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
-            svraster_cuda.grid_loss_bw.grid_eikonal(
-                grid_pts=self.voxel_model._geo_grid_pts,
-                vox_key=self.voxel_model.vox_key,
-                grid_voxel_coord=grid_voxel_coord,
-                grid_voxel_size=grid_voxel_size.view(-1),
-                grid_res=2**max_voxel_level,
-                grid_mask=self.voxel_model.grid_mask,
-                grid_keys=self.voxel_model.grid_keys,
-                grid2voxel=self.voxel_model.grid2voxel,
-                active_list=active_list,
-                weight=cfg.regularizer.lambda_ge_density * lambda_ge_mult * (G / K),
-                vox_size_inv=vox_size_min_inv,
-                no_tv_s=True,
-                tv_sparse=cfg.regularizer.ge_sparse,
-                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
-        
-        # Laplacian平滑正则化
-        laplacian_interval = iteration >= cfg.regularizer.ls_from and iteration <= cfg.regularizer.ls_until
-        if cfg.regularizer.lambda_ls_density and laplacian_interval:
-            lambda_ls_mult = cfg.regularizer.ls_decay_mult ** min(iteration // cfg.regularizer.ls_decay_every, 2)
-            G = self.voxel_model.grid_keys.numel()
-            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
-            active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
-            max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
-            vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
-            svraster_cuda.grid_loss_bw.laplacian_smoothness(
-                grid_pts=self.voxel_model._geo_grid_pts,
-                vox_key=self.voxel_model.vox_key,
-                grid_voxel_coord=grid_voxel_coord,
-                grid_voxel_size=grid_voxel_size.view(-1),
-                grid_res=2**max_voxel_level,
-                grid_mask=self.voxel_model.grid_mask,
-                grid_keys=self.voxel_model.grid_keys,
-                grid2voxel=self.voxel_model.grid2voxel,
-                active_list=active_list,
-                weight=cfg.regularizer.lambda_ls_density * lambda_ls_mult * (G / K),
-                vox_size_inv=vox_size_min_inv,
-                no_tv_s=True,
-                tv_sparse=cfg.regularizer.ls_sparse,
-                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
-        
-        # Points损失（如果有初始点）
-        if hasattr(self, 'initial_points') and self.initial_points is not None:
-            points_interval = iteration >= cfg.regularizer.points_loss_from and cfg.regularizer.points_loss_until >= iteration
-            if cfg.regularizer.lambda_points_density and points_interval:
-                sample_rate = cfg.regularizer.points_sample_rate
-                num_points = self.initial_points.shape[0]
-                num_sample = max(1, int(num_points * sample_rate))
-                idx = torch.randperm(num_points, device=self.initial_points.device)[:num_sample]
-                sampled_points = self.initial_points[idx]
-                points_in_grid = (sampled_points - (self.voxel_model.scene_center - self.voxel_model.inside_extent*0.5)) / \
-                                self.voxel_model.inside_extent * (2**max_voxel_level)
-                lambda_points_mult = cfg.regularizer.points_loss_decay_mult ** (iteration // cfg.regularizer.points_loss_decay_every)
+            K = int(G * (1.0 - float(cfg.regularizer.ge_drop_ratio)))
+            # 避免除零错误：如果K为0或G为0，跳过此正则化
+            if K > 0 and G > 0:
+                active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
                 max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
                 vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
-                svraster_cuda.grid_loss_bw.points_loss(
-                    points_in_grid=points_in_grid,
+                svraster_cuda.grid_loss_bw.grid_eikonal(
                     grid_pts=self.voxel_model._geo_grid_pts,
                     vox_key=self.voxel_model.vox_key,
                     grid_voxel_coord=grid_voxel_coord,
@@ -744,11 +689,71 @@ class Trainer:
                     grid_mask=self.voxel_model.grid_mask,
                     grid_keys=self.voxel_model.grid_keys,
                     grid2voxel=self.voxel_model.grid2voxel,
-                    weight=cfg.regularizer.lambda_points_density * lambda_points_mult,
+                    active_list=active_list,
+                    weight=cfg.regularizer.lambda_ge_density * lambda_ge_mult * (G / K),
                     vox_size_inv=vox_size_min_inv,
                     no_tv_s=True,
-                    tv_sparse=cfg.regularizer.points_loss_sparse,
+                    tv_sparse=cfg.regularizer.ge_sparse,
                     grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Laplacian平滑正则化
+        laplacian_interval = iteration >= cfg.regularizer.ls_from and iteration <= cfg.regularizer.ls_until
+        if cfg.regularizer.lambda_ls_density and laplacian_interval:
+            lambda_ls_mult = cfg.regularizer.ls_decay_mult ** min(iteration // cfg.regularizer.ls_decay_every, 2)
+            G = self.voxel_model.grid_keys.numel()
+            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
+            # 避免除零错误：如果K为0或G为0，跳过此正则化
+            if K > 0 and G > 0:
+                active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
+                max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+                vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
+                svraster_cuda.grid_loss_bw.laplacian_smoothness(
+                    grid_pts=self.voxel_model._geo_grid_pts,
+                    vox_key=self.voxel_model.vox_key,
+                    grid_voxel_coord=grid_voxel_coord,
+                    grid_voxel_size=grid_voxel_size.view(-1),
+                    grid_res=2**max_voxel_level,
+                    grid_mask=self.voxel_model.grid_mask,
+                    grid_keys=self.voxel_model.grid_keys,
+                    grid2voxel=self.voxel_model.grid2voxel,
+                    active_list=active_list,
+                    weight=cfg.regularizer.lambda_ls_density * lambda_ls_mult * (G / K),
+                    vox_size_inv=vox_size_min_inv,
+                    no_tv_s=True,
+                    tv_sparse=cfg.regularizer.ls_sparse,
+                    grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Points损失（如果有初始点）
+        if hasattr(self, 'initial_points') and self.initial_points is not None:
+            points_interval = iteration >= cfg.regularizer.points_loss_from and cfg.regularizer.points_loss_until >= iteration
+            if cfg.regularizer.lambda_points_density and points_interval:
+                sample_rate = cfg.regularizer.points_sample_rate
+                num_points = self.initial_points.shape[0]
+                num_sample = max(1, int(num_points * sample_rate))
+                # 避免除零错误：如果num_points为0，跳过此损失
+                if num_points > 0 and num_sample > 0:
+                    idx = torch.randperm(num_points, device=self.initial_points.device)[:num_sample]
+                    sampled_points = self.initial_points[idx]
+                    max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+                    points_in_grid = (sampled_points - (self.voxel_model.scene_center - self.voxel_model.inside_extent*0.5)) / \
+                                    self.voxel_model.inside_extent * (2**max_voxel_level)
+                    lambda_points_mult = cfg.regularizer.points_loss_decay_mult ** (iteration // cfg.regularizer.points_loss_decay_every)
+                    vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
+                    svraster_cuda.grid_loss_bw.points_loss(
+                        points_in_grid=points_in_grid,
+                        grid_pts=self.voxel_model._geo_grid_pts,
+                        vox_key=self.voxel_model.vox_key,
+                        grid_voxel_coord=grid_voxel_coord,
+                        grid_voxel_size=grid_voxel_size.view(-1),
+                        grid_res=2**max_voxel_level,
+                        grid_mask=self.voxel_model.grid_mask,
+                        grid_keys=self.voxel_model.grid_keys,
+                        grid2voxel=self.voxel_model.grid2voxel,
+                        weight=cfg.regularizer.lambda_points_density * lambda_points_mult,
+                        vox_size_inv=vox_size_min_inv,
+                        no_tv_s=True,
+                        tv_sparse=cfg.regularizer.points_loss_sparse,
+                        grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
 
     def _adaptive_voxels(
         self, 
@@ -1172,7 +1177,16 @@ class Trainer:
         # 冻结voxel几何
         self.voxel_model.freeze_vox_geo()
 
-        if use_tsdf:
+        # 根据density_mode选择提取方法
+        if hasattr(self.voxel_model, 'density_mode') and self.voxel_model.density_mode == 'sdf':
+            # 使用SDF模式提取
+            mesh = self._extract_mesh_sdf(
+                final_lv=final_lv,
+                bbox_scale=bbox_scale,
+                crop_bbox=crop_bbox,
+                iso=iso,
+            )
+        elif use_tsdf:
             # 使用TSDF融合方法
             mesh = self._extract_mesh_tsdf(
                 final_lv=final_lv,
@@ -1245,7 +1259,7 @@ class Trainer:
         final_iso = iso if iso != 0.0 else iso_value
 
         # 提取mesh
-        verts, faces = torch_marching_cubes_grid(
+        verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
             grid_pts_val=sign * self.voxel_model._geo_grid_pts,
             grid_pts_xyz=self.voxel_model.grid_pts_xyz,
             vox_key=self.voxel_model.vox_key[inside_idx],
@@ -1296,7 +1310,18 @@ class Trainer:
             self.voxel_model.octpath, self.voxel_model.octlevel, target_lv)
 
         # 从限制后的自适应稀疏voxels初始化
-        vol = SparseVoxelModel(sh_degree=0)
+        from types import SimpleNamespace
+        cfg_model_vol = SimpleNamespace(
+            vox_geo_mode=self.voxel_model.vox_geo_mode,
+            density_mode=self.voxel_model.density_mode,
+            sh_degree=0,
+            ss=1.0,
+            outside_level=self.voxel_model.outside_level,
+            model_path="",
+            white_background=self.voxel_model.white_background,
+            black_background=self.voxel_model.black_background,
+        )
+        vol = SparseVoxelModel(cfg_model_vol)
         vol.octpath_init(
             self.voxel_model.scene_center,
             self.voxel_model.scene_extent,
@@ -1320,12 +1345,78 @@ class Trainer:
             vol.grid_pts_xyz, bandwidth, crop_border, alpha_thres)
 
         # 从grid提取mesh
-        verts, faces = torch_marching_cubes_grid(
+        verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
             grid_pts_val=grid_tsdf,
             grid_pts_xyz=vol.grid_pts_xyz,
             vox_key=vol.vox_key,
             iso=iso)
 
+        mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
+        return mesh
+
+    @torch.no_grad()
+    def _extract_mesh_sdf(
+        self,
+        final_lv: int,
+        bbox_scale: float,
+        crop_bbox: Optional[torch.Tensor],
+        iso: float = 0.0,
+    ) -> trimesh.Trimesh:
+        """使用SDF模式提取mesh（参考extract_mesh_sdf.py）"""
+        from src.sparse_voxel_gears.adaptive import subdivide_by_interp, agg_voxel_into_grid_pts
+
+        # 1. Crop bounding box
+        if crop_bbox is None:
+            inside_min = self.voxel_model.scene_center - 0.5 * self.voxel_model.inside_extent * bbox_scale
+            inside_max = self.voxel_model.scene_center + 0.5 * self.voxel_model.inside_extent * bbox_scale
+        else:
+            inside_min = crop_bbox[0].cuda() if not crop_bbox[0].is_cuda else crop_bbox[0]
+            inside_max = crop_bbox[1].cuda() if not crop_bbox[1].is_cuda else crop_bbox[1]
+        
+        inside_mask = ((inside_min <= self.voxel_model.grid_pts_xyz) & 
+                      (self.voxel_model.grid_pts_xyz <= inside_max)).all(-1)
+        inside_mask = inside_mask[self.voxel_model.vox_key].any(-1)
+        inside_idx = torch.where(inside_mask)[0]
+
+        # 2. Clamp voxel level
+        octpath = self.voxel_model.octpath[inside_idx]
+        octlevel = self.voxel_model.octlevel[inside_idx]
+        target_level = self.voxel_model.outside_level + final_lv
+        octpath, octlevel = octree_utils.clamp_level(octpath, octlevel, target_level)
+        print(f'[SDF] Voxel levels from {octlevel.min()} to {octlevel.max()}')
+
+        # 3. Grid坐标计算
+        # 注意：extract_mesh_sdf.py中第275行使用voxel_model.grid_pts_key（原始模型的grid_pts_key）
+        # 第272行虽然计算了新的grid_pts_key，但第275行使用的是原始的
+        grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+        grid_pts_xyz = octree_utils.compute_gridpoints_xyz(self.voxel_model.grid_pts_key, self.voxel_model.scene_center, self.voxel_model.scene_extent)
+        
+        # 4. SDF corner value提取
+        grid_sdf_vals = self.voxel_model._geo_grid_pts
+        print(f'[SDF] Grid points: {len(grid_pts_xyz)}')
+        
+        # 5. SDF aggregation（简化版本，不使用use_lv_avg）
+        # 注意：extract_mesh_sdf.py中如果use_lv_avg=False（第319-321行），会重新聚合grid_sdf_vals
+        # 但第329行的marching cubes使用的是原始的voxel_model._geo_grid_pts、grid_pts_xyz和vox_key
+        # 这里我们按照extract_mesh_sdf.py的逻辑：虽然重新聚合了，但marching cubes时使用原始值
+        from src.sparse_voxel_gears.adaptive import agg_voxel_into_grid_pts
+        # 使用新计算的vox_key从原始的grid_sdf_vals中提取值
+        unit_val = grid_sdf_vals[vox_key]
+        # 重新聚合（虽然marching cubes时不会用到，但按照extract_mesh_sdf.py的逻辑执行）
+        grid_sdf_vals = agg_voxel_into_grid_pts(len(grid_pts_xyz), vox_key, unit_val)
+
+        torch.cuda.empty_cache()
+
+        # 6. Marching Cubes
+        # 注意：extract_mesh_sdf.py第329行使用的是voxel_model._geo_grid_pts、voxel_model.grid_pts_xyz和voxel_model.vox_key
+        # 虽然第321行重新聚合了grid_sdf_vals，但marching cubes时使用的是原始值
+        # 这里我们按照extract_mesh_sdf.py的逻辑：使用原始模型的属性
+        verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
+            grid_pts_val=self.voxel_model._geo_grid_pts,
+            grid_pts_xyz=self.voxel_model.grid_pts_xyz,
+            vox_key=self.voxel_model.vox_key,
+            iso=iso
+        )
         mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
         return mesh
 

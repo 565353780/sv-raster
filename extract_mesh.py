@@ -7,7 +7,6 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
-import math
 import time
 import numpy as np
 from tqdm import tqdm
@@ -16,13 +15,14 @@ import trimesh
 import torch
 import svraster_cuda
 
-from src.config import cfg, update_argparser, update_config
+from src.config import cfg, update_config
 from src.utils import octree_utils
 from src.utils import activation_utils
 from src.sparse_voxel_gears.adaptive import subdivide_by_interp, agg_voxel_into_grid_pts
 
 from src.dataloader.data_pack import DataPack
-from src.sparse_voxel_model import SparseVoxelModel
+
+from sv_raster.Model.sparse_voxel import SparseVoxelModel
  
 from src.utils.fuser_utils import Fuser
 

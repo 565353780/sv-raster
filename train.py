@@ -18,7 +18,6 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
-import sys
 import json
 import time
 import uuid
@@ -26,11 +25,10 @@ import imageio
 import datetime
 import numpy as np
 from tqdm import tqdm
-from random import randint
 
 import torch
 
-from src.config import cfg, update_argparser, update_config
+from src.config import cfg, update_config
 
 from src.utils.system_utils import seed_everything
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
@@ -39,7 +37,8 @@ from src.utils import mono_utils
 from src.utils import loss_utils
 from src.utils import octree_utils
 from src.dataloader.data_pack import DataPack, compute_iter_idx_sparse
-from src.sparse_voxel_model import SparseVoxelModel
+
+from sv_raster.Model.sparse_voxel import SparseVoxelModel
 
 import svraster_cuda
 

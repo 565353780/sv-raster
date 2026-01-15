@@ -20,6 +20,7 @@ class ColmapCamera:
         self.rgbd_camera = rgbd_camera
         self.image_name = image_name
         self.near = near
+        self.cam_mode = 'persp'  # 透视投影模式，与src/cameras.py中的Camera类保持一致
 
         # 缓存计算结果
         self._w2c = None
@@ -45,6 +46,14 @@ class ColmapCamera:
         # 深度和mask
         self.depth = self.rgbd_camera.depth.cpu() if self.rgbd_camera.depth is not None else None
         self.mask = None  # 可以根据需要从 valid_depth_mask 生成
+
+        # 法线和置信度（如果RGBDCamera有这些属性）
+        # 注意：如果RGBDCamera没有normal/conf属性，这些将为None，损失函数会正确处理
+        # normal和conf的初始化延迟到第一次访问时（因为需要c2w属性）
+        self._normal = None
+        self._conf = None
+        self._normal_initialized = False
+        self._conf_initialized = False
 
         # 稀疏点
         self.sparse_pt = None
@@ -125,6 +134,44 @@ class ColmapCamera:
     def pix_size(self) -> float:
         return 2 * self.tanfovx / self.image_width
 
+    @property
+    def normal(self):
+        """法线图（世界坐标系）"""
+        if not self._normal_initialized:
+            self._normal_initialized = True
+            if hasattr(self.rgbd_camera, 'normal') and self.rgbd_camera.normal is not None:
+                # 如果normal存在，需要转换为世界坐标系（与src/dataloader/data_pack.py中的逻辑一致）
+                normal_cam = self.rgbd_camera.normal
+                if isinstance(normal_cam, torch.Tensor) and normal_cam.dim() == 3 and normal_cam.shape[0] == 3:
+                    # normal_cam是[3,H,W]格式，在相机坐标系中
+                    # 需要转换到世界坐标系
+                    R_wc = self.c2w[:3, :3].T  # 世界到相机的旋转矩阵的转置
+                    normal_world = torch.einsum('ij,jhw->ihw', R_wc, normal_cam)
+                    self._normal = torch.nn.functional.normalize(normal_world, dim=0, eps=1e-8).cpu()
+                else:
+                    self._normal = normal_cam.cpu() if isinstance(normal_cam, torch.Tensor) else None
+            else:
+                self._normal = None
+        return self._normal
+
+    @property
+    def conf(self):
+        """置信度图"""
+        if not self._conf_initialized:
+            self._conf_initialized = True
+            if hasattr(self.rgbd_camera, 'conf') and self.rgbd_camera.conf is not None:
+                conf_val = self.rgbd_camera.conf
+                if isinstance(conf_val, torch.Tensor):
+                    self._conf = conf_val.cpu()
+                    if self._conf.dim() == 2:
+                        # 如果是[H,W]，添加通道维度变成[1,H,W]
+                        self._conf = self._conf.unsqueeze(0)
+                else:
+                    self._conf = None
+            else:
+                self._conf = None
+        return self._conf
+
     def to(self, device: str):
         """移动数据到指定设备"""
         if self.image is not None:
@@ -133,6 +180,10 @@ class ColmapCamera:
             self.depth = self.depth.to(device)
         if self.mask is not None:
             self.mask = self.mask.to(device)
+        if self.normal is not None:
+            self.normal = self.normal.to(device)
+        if self.conf is not None:
+            self.conf = self.conf.to(device)
         return self
 
     def project(self, pts: torch.Tensor, return_depth: bool = False):
