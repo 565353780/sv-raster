@@ -6,19 +6,16 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-import os
-import numpy as np
-
 import torch
 import svraster_cuda
 
-from src.sparse_voxel_gears.constructor import SVConstructor # initialize the model
-from src.sparse_voxel_gears.properties import SVProperties  # Import SVProperties for handling voxel properties
-from src.sparse_voxel_gears.renderer import SVRenderer # render the model
-from src.sparse_voxel_gears.adaptive import SVAdaptive # Handles adaptive voxel grid refinement, including subdivision and pruning
-from src.sparse_voxel_gears.optimizer import SVOptimizer # Optimizer for the model
-from src.sparse_voxel_gears.io import SVInOut # Handles input and output operations, including loading and saving models
-from src.sparse_voxel_gears.pooling import SVPooling    # Handles pooling operations for the model
+from sv_raster.Model.sparse_voxel_gears.constructor import SVConstructor # initialize the model
+from sv_raster.Model.sparse_voxel_gears.properties import SVProperties  # Import SVProperties for handling voxel properties
+from sv_raster.Model.sparse_voxel_gears.renderer import SVRenderer # render the model
+from sv_raster.Model.sparse_voxel_gears.adaptive import SVAdaptive # Handles adaptive voxel grid refinement, including subdivision and pruning
+from sv_raster.Model.sparse_voxel_gears.optimizer import SVOptimizer # Optimizer for the model
+from sv_raster.Model.sparse_voxel_gears.io import SVInOut # Handles input and output operations, including loading and saving models
+from sv_raster.Model.sparse_voxel_gears.pooling import SVPooling    # Handles pooling operations for the model
 
 
 class SparseVoxelModel(SVConstructor, SVProperties, SVRenderer, SVAdaptive, SVOptimizer, SVInOut, SVPooling):
