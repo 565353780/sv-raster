@@ -1,0 +1,21 @@
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# NVIDIA CORPORATION and its licensors retain all intellectual property
+# and proprietary rights in and to this software, related documentation
+# and any modifications thereto.  Any use, reproduction, disclosure or
+# distribution of this software and related documentation without an express
+# license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+# See `src/config.py` for the base setup.
+model:
+  n_samp_per_vox: 3
+
+data:
+  eval: False
+  res_downscale: 2.0
+
+regularizer:
+  lambda_T_inside: 0.01
+  lambda_R_concen: 0.1
+  lambda_normal_dmean: 0.001
+  lambda_normal_dmed: 0.001
