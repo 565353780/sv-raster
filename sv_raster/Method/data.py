@@ -1,21 +1,8 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# NVIDIA CORPORATION and its licensors retain all intellectual property
-# and proprietary rights in and to this software, related documentation
-# and any modifications thereto.  Any use, reproduction, disclosure or
-# distribution of this software and related documentation without an express
-# license agreement from NVIDIA CORPORATION is strictly prohibited.
-
-"""
-数据处理辅助函数
-"""
-
 import os
-import numpy as np
-from typing import Optional, Union, List, Tuple
-
 import torch
 import trimesh
+import numpy as np
+from typing import Optional, Union, Tuple
 
 
 def loadPointCloud(
@@ -158,65 +145,3 @@ def normalizePoints(
         normalized = torch.tensor(normalized, dtype=dtype, device=device)
 
     return normalized, center, scale
-
-
-def im_tensor2np(tensor: torch.Tensor) -> np.ndarray:
-    """
-    将图像tensor转换为numpy数组
-
-    Args:
-        tensor: 图像tensor，形状为 (C, H, W) 或 (H, W, C)，范围 [0, 1]
-
-    Returns:
-        numpy数组，形状为 (H, W, C)，范围 [0, 255]，dtype为uint8
-    """
-    if tensor.dim() == 3 and tensor.shape[0] in [1, 3, 4]:
-        # CHW -> HWC
-        tensor = tensor.permute(1, 2, 0)
-
-    img = tensor.detach().cpu().numpy()
-    img = (img * 255).clip(0, 255).astype(np.uint8)
-
-    return img
-
-
-def viz_tensordepth(
-    depth: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
-    cmap: str = 'viridis',
-) -> np.ndarray:
-    """
-    将深度tensor可视化为彩色图像
-
-    Args:
-        depth: 深度tensor，形状为 (H, W)
-        alpha: 透明度mask，形状为 (H, W)
-        cmap: matplotlib colormap名称
-
-    Returns:
-        numpy数组，形状为 (H, W, 3)，范围 [0, 255]，dtype为uint8
-    """
-    import matplotlib.pyplot as plt
-
-    depth_np = depth.detach().cpu().numpy()
-
-    if alpha is not None:
-        alpha_np = alpha.detach().cpu().numpy()
-        valid_mask = alpha_np > 0.5
-        if valid_mask.any():
-            depth_min = depth_np[valid_mask].min()
-            depth_max = depth_np[valid_mask].max()
-        else:
-            depth_min, depth_max = 0, 1
-    else:
-        depth_min = depth_np.min()
-        depth_max = depth_np.max()
-
-    depth_normalized = (depth_np - depth_min) / (depth_max - depth_min + 1e-8)
-    depth_normalized = depth_normalized.clip(0, 1)
-
-    colormap = plt.get_cmap(cmap)
-    depth_colored = colormap(depth_normalized)[:, :, :3]
-    depth_colored = (depth_colored * 255).astype(np.uint8)
-
-    return depth_colored

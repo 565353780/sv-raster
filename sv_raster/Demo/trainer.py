@@ -1,5 +1,6 @@
 import sys
 sys.path.append('../../MATCH/camera-control')
+sys.path.append('../../RECON/octree-shape')
 
 import os
 import cv2
@@ -24,6 +25,7 @@ def demo():
     home = os.environ['HOME']
     save_data_folder_path = home + "/chLi/Dataset/pixel_align/" + shape_id + '/'
     gen_mesh_file_path = save_data_folder_path + 'stage2_64_n.ply'
+    octree_depth = 7
 
     print("=" * 50)
     print("Demo: Train from Mesh")
@@ -46,7 +48,7 @@ def demo():
             seed=42,
         ),
         init=InitConfig(
-            init_n_level=6,
+            init_n_level=octree_depth,
         ),
     )
 
@@ -55,13 +57,11 @@ def demo():
 
     # 加载 mesh（替换为实际的 mesh 文件路径）
     assert os.path.exists(gen_mesh_file_path)
-    trainer.loadMeshFile(gen_mesh_file_path, vox_level=6)
+    trainer.loadMeshFile(gen_mesh_file_path, depth_max=octree_depth)
 
-    for i in range(len(camera_list)):
-        trainer.addCamera(camera_list[i], is_test=False)
+    trainer.addCameras(camera_list)
 
     print(f"[INFO] Added {len(trainer.train_cameras)} training cameras")
-    print(f"[INFO] Added {len(trainer.test_cameras)} test cameras")
 
     # 开始训练
     trainer.train(verbose=True)

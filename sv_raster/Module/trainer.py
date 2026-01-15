@@ -3,11 +3,15 @@ import cv2
 import torch
 import trimesh
 import numpy as np
+import open3d as o3d
 from tqdm import tqdm
 from copy import deepcopy
 from typing import List, Optional, Union
 
+from camera_control.Method.data import toTensor
 from camera_control.Module.rgbd_camera import RGBDCamera
+
+from octree_shape.Module.octree_builder import OctreeBuilder
 
 import svraster_cuda
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
@@ -16,6 +20,41 @@ from sv_raster.Config.config import TrainerConfig, cfg
 from sv_raster.Data.colmap_camera import ColmapCamera
 from sv_raster.Method.io import loadMeshFile
 from sv_raster.Model.sparse_voxel import SparseVoxelModel
+
+
+def demo():
+    octree_builder = OctreeBuilder(
+        mesh_file_path,
+        depth_max=8,
+        focus_center=[0, 0, 0],
+        focus_length=1.0,
+        normalize_scale=0.99,
+        output_info=True,
+    )
+
+    leaf_num = octree_builder.leafNum
+    shape_code = octree_builder.getShapeCode()
+
+    print("shape leaf num:", leaf_num)
+    print("shape code size:", len(shape_code))
+
+    octree_builder.loadShapeCode(shape_code)
+
+    leaf_num = octree_builder.leafNum
+    shape_code = octree_builder.getShapeCode()
+
+    print("shape leaf num:", leaf_num)
+    print("shape code size:", len(shape_code))
+
+    octree_builder.renderLeaf()
+
+    for depth in range(1, depth_max + 1):
+        octree_builder.renderDepth(depth)
+
+    occ = octree_builder.getDepthOcc(8)
+    print("occ shape:", occ.shape)
+    octree_builder.renderDepthOcc(8)
+    return True
 
 
 class Trainer:
@@ -74,8 +113,7 @@ class Trainer:
     def loadMeshFile(
         self,
         mesh_file_path: str,
-        vox_level: int = 9,
-        sample_density: float = 100.0,
+        depth_max: int = 9,
     ) -> bool:
         """
         加载mesh并将其初始化为sparse voxel
@@ -83,7 +121,6 @@ class Trainer:
         Args:
             mesh_file_path: mesh文件路径
             vox_level: voxel的octree层级
-            sample_density: 每单位面积的采样点数
 
         Returns:
             是否成功
@@ -92,161 +129,52 @@ class Trainer:
         if mesh is None:
             return False
 
-        # 从mesh表面采样点
-        # 计算采样点数
-        area = mesh.area
-        n_samples = max(10000, int(area * sample_density))
-        points, face_indices = trimesh.sample.sample_surface(mesh, n_samples)
-        points = torch.tensor(points, dtype=torch.float32, device="cuda")
+        octree_builder = OctreeBuilder(
+            mesh=mesh,
+            depth_max=depth_max,
+            focus_center=[0, 0, 0],
+            focus_length=1.0,
+            normalize_scale=None,
+            output_info=True,
+        )
 
-        # 获取颜色（如果有）
-        if mesh.visual.vertex_colors is not None:
-            # 从顶点颜色插值
-            vertex_colors = mesh.visual.vertex_colors[:, :3] / 255.0
-            face_vertices = mesh.faces[face_indices]
-            colors = vertex_colors[face_vertices].mean(axis=1)
-            colors = torch.tensor(colors, dtype=torch.float32, device="cuda")
-        else:
-            colors = torch.ones_like(points) * 0.5
+        voxel_centers = octree_builder.getDepthCenters(depth_max)
 
-        self.init_points = points
-        self.init_colors = colors
+        self.init_points = toTensor(voxel_centers, torch.float32, 'cuda')
+        self.init_colors = None
 
         # 计算边界
-        self._compute_bounding_from_points(points)
+        self.bounding = toTensor([
+            [-0.5, -0.5, -0.5],
+            [0.5, 0.5, 0.5],
+        ], torch.float32, 'cuda')
 
-        print(f"[INFO] Loaded mesh with {len(points)} sampled points")
+        print(f"[INFO] Loaded mesh with {self.init_points.shape[0]} sampled points")
         return True
-
-    def loadPcdFile(
-        self,
-        pcd_file_path: str,
-        vox_level: int = 9,
-    ) -> bool:
-        """
-        加载点云并将其初始化为sparse voxel
-
-        Args:
-            pcd_file_path: 点云文件路径
-            vox_level: voxel的octree层级
-
-        Returns:
-            是否成功
-        """
-        if not os.path.exists(pcd_file_path):
-            print(f'[ERROR][Trainer::loadPcdFile]')
-            print(f'\t pcd file not exist!')
-            print(f'\t pcd_file_path: {pcd_file_path}')
-            return False
-
-        pcd = trimesh.load(pcd_file_path)
-
-        # 获取点坐标
-        if hasattr(pcd, 'vertices'):
-            points = np.array(pcd.vertices)
-        elif hasattr(pcd, 'points'):
-            points = np.array(pcd.points)
-        else:
-            print(f'[ERROR][Trainer::loadPcdFile]')
-            print(f'\t Cannot extract points from file')
-            return False
-
-        points = torch.tensor(points, dtype=torch.float32, device="cuda")
-
-        # 获取颜色（如果有）
-        if hasattr(pcd, 'colors') and pcd.colors is not None:
-            colors = np.array(pcd.colors)[:, :3]
-            if colors.max() > 1.0:
-                colors = colors / 255.0
-            colors = torch.tensor(colors, dtype=torch.float32, device="cuda")
-        elif hasattr(pcd, 'visual') and hasattr(pcd.visual, 'vertex_colors'):
-            colors = np.array(pcd.visual.vertex_colors)[:, :3] / 255.0
-            colors = torch.tensor(colors, dtype=torch.float32, device="cuda")
-        else:
-            colors = torch.ones_like(points) * 0.5
-
-        self.init_points = points
-        self.init_colors = colors
-
-        # 计算边界
-        self._compute_bounding_from_points(points)
-
-        print(f"[INFO] Loaded point cloud with {len(points)} points")
-        return True
-
-    def _compute_bounding_from_points(self, points: torch.Tensor) -> None:
-        """从点云计算边界"""
-        min_bound = points.min(dim=0).values
-        max_bound = points.max(dim=0).values
-
-        # 添加一些padding
-        extent = max_bound - min_bound
-        padding = extent * 0.1
-        min_bound = min_bound - padding
-        max_bound = max_bound + padding
-
-        self.bounding = torch.stack([min_bound, max_bound])
 
     def addCamera(
         self,
         camera: RGBDCamera,
-        is_test: bool = False,
-        image_name: Optional[str] = None,
     ) -> bool:
-        """
-        添加相机到训练/测试集
-
-        Args:
-            camera: RGBDCamera实例
-            is_test: 是否为测试相机
-            image_name: 图像名称
-
-        Returns:
-            是否成功
-        """
-        if image_name is None:
-            idx = len(self.test_cameras if is_test else self.train_cameras)
-            image_name = f"{'test' if is_test else 'train'}_{idx:04d}"
+        idx = len(self.train_cameras)
+        image_name = f"train_{idx:06d}"
 
         training_cam = ColmapCamera(camera, image_name=image_name)
 
-        if is_test:
-            self.test_cameras.append(training_cam)
-        else:
-            self.train_cameras.append(training_cam)
-
+        self.train_cameras.append(training_cam)
         return True
 
     def addCameras(
         self,
         cameras: List[RGBDCamera],
-        is_test: bool = False,
     ) -> bool:
-        """
-        批量添加相机
-
-        Args:
-            cameras: RGBDCamera列表
-            is_test: 是否为测试相机
-
-        Returns:
-            是否成功
-        """
-        for i, cam in enumerate(cameras):
-            self.addCamera(cam, is_test=is_test)
+        for cam in cameras:
+            self.addCamera(cam)
         return True
 
     def _init_voxel_model(self) -> bool:
         """初始化voxel模型"""
-        if self.bounding is None:
-            if len(self.train_cameras) > 0:
-                # 从相机位置估计边界
-                positions = torch.stack([cam.position for cam in self.train_cameras])
-                self._compute_bounding_from_points(positions)
-            else:
-                print('[ERROR][Trainer::_init_voxel_model]')
-                print('\t No bounding available. Please load mesh/pcd or add cameras first.')
-                return False
+        assert self.bounding is not None
 
         cfg = self.config
 
