@@ -248,6 +248,7 @@ class Trainer:
 
     def train(
         self,
+        save_data_folder_path: str,
         verbose: bool = True,
     ) -> bool:
         """
@@ -460,6 +461,18 @@ class Trainer:
                 # 保存检查点
                 if iteration in cfg.output.checkpoint_iterations or iteration == n_iter:
                     self.save(iteration)
+
+                if iteration % 1000 == 0:
+                    render_image = self.render(
+                        self.train_cameras[0].rgbd_camera,
+                        output_T=True,
+                        output_depth=True,
+                        output_normal=True,
+                    )
+                    out_path = save_data_folder_path + f"/render/iter{iteration:06d}_cam0.png"
+
+                    createFileFolder(out_path)
+                    cv2.imwrite(out_path, render_image)
 
         if verbose:
             progress_bar.close()

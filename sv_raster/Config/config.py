@@ -78,16 +78,16 @@ class RegularizerConfig:
     mast3r_metric_depth_end_mult: float = 0.01
 
     # 最终透射率应集中到0或1
-    lambda_T_concen: float = 0.0
+    lambda_T_concen: float = 0.1
 
     # 最终透射率应为0
-    lambda_T_inside: float = 0.0
+    lambda_T_inside: float = 0.01
 
     # 每点RGB损失
     lambda_R_concen: float = 0.01
 
     # 几何正则化
-    lambda_ascending: float = 0.0
+    lambda_ascending: float = 0.01
     ascending_from: int = 0
 
     # 分布损失（鼓励分布在射线上集中）
@@ -95,14 +95,14 @@ class RegularizerConfig:
     dist_from: int = 10000
 
     # 渲染法线与期望深度导出法线的一致性损失
-    lambda_normal_dmean: float = 0.0
+    lambda_normal_dmean: float = 0.001
     n_dmean_from: int = 10_000
     n_dmean_end: int = 20_000
     n_dmean_ks: int = 3
     n_dmean_tol_deg: float = 90.0
 
     # 渲染法线与中值深度导出法线的一致性损失
-    lambda_normal_dmed: float = 0.0
+    lambda_normal_dmed: float = 0.01
     n_dmed_from: int = 3000
     n_dmed_end: int = 20_000
 

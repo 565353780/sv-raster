@@ -25,7 +25,7 @@ def demo():
     home = os.environ['HOME']
     save_data_folder_path = home + "/chLi/Dataset/pixel_align/" + shape_id + '/'
     gen_mesh_file_path = save_data_folder_path + 'stage2_64_n.ply'
-    octree_depth = 7
+    octree_depth = 6
 
     print("=" * 50)
     print("Demo: Train from Mesh")
@@ -44,7 +44,7 @@ def demo():
             white_background=True,
         ),
         procedure=ProcedureConfig(
-            n_iter=3000,
+            n_iter=20000,
             seed=42,
         ),
         init=InitConfig(
@@ -64,11 +64,11 @@ def demo():
     print(f"[INFO] Added {len(trainer.train_cameras)} training cameras")
 
     # 开始训练
-    trainer.train(verbose=True)
+    trainer.train(save_data_folder_path=save_data_folder_path + 'svrast/')
 
     print("[INFO] Demo completed (training skipped for demo)")
 
-    output_folder = os.path.join(save_data_folder_path, "svraster", "render")
+    output_folder = os.path.join(save_data_folder_path, "svraster", "render_final/")
     os.makedirs(output_folder, exist_ok=True)
 
     print(f"[INFO] start save concatenated image to {output_folder}")
