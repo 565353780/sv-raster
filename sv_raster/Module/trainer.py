@@ -140,75 +140,84 @@ class Trainer:
             self.addCamera(cam)
         return True
 
-    def _init_voxel_model(self) -> bool:
+    def _init_voxel_model(self, sfm_init_data=None) -> bool:
         """初始化voxel模型"""
         assert self.bounding is not None
 
         cfg = self.config
 
-        # 创建voxel模型
-        self.voxel_model = SparseVoxelModel(
-            n_samp_per_vox=cfg.model.n_samp_per_vox,
+        # 创建voxel模型（使用cfg.model配置对象）
+        from types import SimpleNamespace
+        cfg_model = SimpleNamespace(
+            vox_geo_mode=cfg.model.vox_geo_mode,
+            density_mode=cfg.model.density_mode,
             sh_degree=cfg.model.sh_degree,
             ss=cfg.model.ss,
+            outside_level=cfg.bounding.outside_level,
+            model_path=cfg.output.model_path,
             white_background=cfg.model.white_background,
             black_background=cfg.model.black_background,
         )
+        self.voxel_model = SparseVoxelModel(cfg_model)
 
-        # 如果有初始化点，使用points_init
-        if self.init_points is not None:
-            # 计算voxel大小
-            extent = (self.bounding[1] - self.bounding[0]).max()
-            vox_size = extent / (2 ** cfg.init.init_n_level)
-
-            self.voxel_model.points_init(
-                scene_center=(self.bounding[0] + self.bounding[1]) * 0.5,
-                scene_extent=extent * (2 ** cfg.bounding.outside_level),
-                xyz=self.init_points,
-                expected_vox_size=vox_size,
-                rgb=self.init_colors if self.init_colors is not None else cfg.init.sh0_init,
-                density=cfg.init.geo_init,
+        # 如果有初始化点，将其转换为sfm_init_data格式
+        if self.init_points is not None and sfm_init_data is None:
+            # 将init_points转换为SFMInitData格式
+            from src.dataloader.reader_scene_info import SFMInitData
+            points_xyz = self.init_points.cpu().numpy() if isinstance(self.init_points, torch.Tensor) else self.init_points
+            sfm_init_data = SFMInitData(
+                points_xyz=points_xyz,
+                index_to_point_id=None,
+                point_id_to_image_ids=None
             )
-        else:
-            # 使用model_init（从相机初始化）
-            self.voxel_model.model_init(
-                bounding=self.bounding,
-                outside_level=cfg.bounding.outside_level,
-                init_n_level=cfg.init.init_n_level,
-                init_out_ratio=cfg.init.init_out_ratio,
-                sh_degree_init=cfg.init.sh_degree_init,
-                geo_init=cfg.init.geo_init,
-                sh0_init=cfg.init.sh0_init,
-                shs_init=cfg.init.shs_init,
-                cameras=self.train_cameras if len(self.train_cameras) > 0 else None,
-            )
+            print(f"[INFO] Converted {len(points_xyz)} init_points to SFMInitData format")
+        
+        # 统一使用model_init（从相机或点云初始化）
+        cfg_init = SimpleNamespace(
+            geo_init=cfg.init.geo_init,
+            sh0_init=cfg.init.sh0_init,
+            shs_init=cfg.init.shs_init,
+            log_s_init=cfg.init.log_s_init,
+            sh_degree_init=cfg.init.sh_degree_init,
+            init_n_level=cfg.init.init_n_level,
+            outside_mode=cfg.init.outside_mode,
+            init_out_ratio=cfg.init.init_out_ratio,
+            aabb_crop=cfg.init.aabb_crop,
+            init_sparse_points=cfg.init.init_sparse_points,
+        )
+        self.voxel_model.model_init(
+            bounding=self.bounding,
+            cfg_init=cfg_init,
+            cfg_mode=cfg.model.density_mode,
+            cameras=self.train_cameras if len(self.train_cameras) > 0 else None,
+            sfm_init=sfm_init_data,
+        )
 
         print(f"[INFO] Initialized voxel model with {self.voxel_model.num_voxels} voxels")
         return True
 
     def _create_optimizer(self):
-        """创建优化器和调度器"""
+        """创建优化器（使用voxel_model的optimizer_init方法）"""
         cfg = self.config
-
-        optimizer = svraster_cuda.sparse_adam.SparseAdam(
-            [
-                {'params': [self.voxel_model._geo_grid_pts], 'lr': cfg.optimizer.geo_lr},
-                {'params': [self.voxel_model._sh0], 'lr': cfg.optimizer.sh0_lr},
-                {'params': [self.voxel_model._shs], 'lr': cfg.optimizer.shs_lr},
-            ],
-            betas=(cfg.optimizer.optim_beta1, cfg.optimizer.optim_beta2),
-            eps=cfg.optimizer.optim_eps)
-
-        scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            optimizer,
-            milestones=cfg.optimizer.lr_decay_ckpt,
-            gamma=cfg.optimizer.lr_decay_mult)
-
-        return optimizer, scheduler
+        
+        from types import SimpleNamespace
+        cfg_optimizer = SimpleNamespace(
+            geo_lr=cfg.optimizer.geo_lr,
+            sh0_lr=cfg.optimizer.sh0_lr,
+            shs_lr=cfg.optimizer.shs_lr,
+            log_s_lr=cfg.optimizer.log_s_lr,
+            optim_beta1=cfg.optimizer.optim_beta1,
+            optim_beta2=cfg.optimizer.optim_beta2,
+            optim_eps=cfg.optimizer.optim_eps,
+        )
+        self.voxel_model.optimizer_init(cfg_optimizer)
+        
+        return self.voxel_model.optimizer
 
     def _compute_iter_idx(self, n_cameras: int, n_iters: int) -> np.ndarray:
-        """计算每次迭代使用的相机索引"""
-        return np.random.randint(0, n_cameras, size=n_iters)
+        """计算每次迭代使用的相机索引（使用compute_iter_idx_sparse）"""
+        from src.dataloader.data_pack import compute_iter_idx_sparse
+        return compute_iter_idx_sparse(n_cameras, n_iters, 1)
 
     def train(
         self,
@@ -231,7 +240,16 @@ class Trainer:
 
         # 初始化模型（如果还没有）
         if self.voxel_model is None:
-            if not self._init_voxel_model():
+            # 如果有data_pack，获取sfm_init_data
+            sfm_init_data = None
+            if hasattr(self, 'data_pack') and self.data_pack is not None:
+                sfm_init_data = self.data_pack.sfm_init_data
+                # 保存initial_points用于points损失
+                if hasattr(self.data_pack.sfm_init_data, 'points_xyz'):
+                    self.initial_points = torch.from_numpy(self.data_pack.sfm_init_data.points_xyz).float().to("cuda")
+                    print(f"point num = {self.initial_points.shape[0]}")
+            
+            if not self._init_voxel_model(sfm_init_data=sfm_init_data):
                 return False
 
         cfg = self.config
@@ -243,7 +261,27 @@ class Trainer:
                 cam.auto_exposure_init()
 
         # 创建优化器
-        self.optimizer, self.scheduler = self._create_optimizer()
+        self.optimizer = self._create_optimizer()
+        
+        # 初始化学习率warmup
+        first_iter = self.current_iteration + 1
+        if first_iter <= cfg.optimizer.n_warmup:
+            rate = max(first_iter - 1, 0) / cfg.optimizer.n_warmup
+            for param_group in self.voxel_model.optimizer.param_groups:
+                param_group["base_lr"] = param_group["lr"]
+                param_group["lr"] = rate * param_group["base_lr"]
+
+        # 初始化subdiv参数
+        remain_subdiv_times = sum(
+            (i >= first_iter)
+            for i in range(
+                cfg.procedure.subdivide_from, cfg.procedure.subdivide_until+1,
+                cfg.procedure.subdivide_every
+            )
+        )
+        subdivide_scale = cfg.procedure.subdivide_target_scale ** (1 / remain_subdiv_times) if remain_subdiv_times > 0 else 1.0
+        subdivide_prop = max(0, (subdivide_scale - 1) / 7)
+        print(f"Subdiv: times={remain_subdiv_times:2d} scale-each-time={subdivide_scale*100:.1f}% prop={subdivide_prop*100:.1f}%")
 
         # 计算相机索引
         tr_cam_indices = self._compute_iter_idx(len(self.train_cameras), n_iter)
@@ -263,6 +301,14 @@ class Trainer:
         from src.utils import loss_utils
         sparse_depth_loss = loss_utils.SparseDepthLoss(
             iter_end=cfg.regularizer.sparse_depth_until)
+        depthanythingv2_loss = loss_utils.DepthAnythingv2Loss(
+            iter_from=cfg.regularizer.depthanythingv2_from,
+            iter_end=cfg.regularizer.depthanythingv2_end,
+            end_mult=cfg.regularizer.depthanythingv2_end_mult)
+        mast3r_metric_depth_loss = loss_utils.Mast3rMetricDepthLoss(
+            iter_from=cfg.regularizer.mast3r_metric_depth_from,
+            iter_end=cfg.regularizer.mast3r_metric_depth_end,
+            end_mult=cfg.regularizer.mast3r_metric_depth_end_mult)
         nd_loss = loss_utils.NormalDepthConsistencyLoss(
             iter_from=cfg.regularizer.n_dmean_from,
             iter_end=cfg.regularizer.n_dmean_end,
@@ -271,6 +317,34 @@ class Trainer:
         nmed_loss = loss_utils.NormalMedianConsistencyLoss(
             iter_from=cfg.regularizer.n_dmed_from,
             iter_end=cfg.regularizer.n_dmed_end)
+        pi3_normal_loss = loss_utils.Pi3NormalLoss(
+            iter_from=cfg.regularizer.pi3_normal_from,
+            iter_end=cfg.regularizer.pi3_normal_end
+        )
+
+        # 初始化grid相关参数（用于正则化）
+        max_voxel_level = self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level
+        grid_voxel_coord = ((self.voxel_model.vox_center - self.voxel_model.vox_size * 0.5) - 
+                          (self.voxel_model.scene_center - self.voxel_model.inside_extent * 0.5)) / \
+                          self.voxel_model.inside_extent * (2**max_voxel_level)
+        grid_voxel_size = (self.voxel_model.vox_size / self.voxel_model.inside_extent) * (2**max_voxel_level)
+        
+        # 保存initial_points（如果有）用于points损失
+        self.initial_points = None  # 将在需要时从data_pack获取
+        
+        # 初始化log_s（如果使用SDF模式）
+        if hasattr(self.voxel_model, '_log_s') and cfg.model.density_mode == 'sdf':
+            device = self.voxel_model._log_s.device
+            dtype = self.voxel_model._log_s.dtype
+            learning_thickness = 2.0
+            vox_size_min_inv = 1.0 / self.voxel_model.vox_size.min().item()
+            vsmi = torch.as_tensor(vox_size_min_inv, device=device, dtype=dtype)
+            init = 0.1 * torch.log(
+                torch.log(torch.tensor(99.0, device=device, dtype=dtype)) * vsmi / learning_thickness / 2
+            )
+            with torch.no_grad():
+                self.voxel_model._log_s.copy_(init)
+            print(f"log_s init = {self.voxel_model._log_s.item():.9f}")
 
         # 训练循环
         iter_start = torch.cuda.Event(enable_timing=True)
@@ -280,7 +354,6 @@ class Trainer:
         ema_loss_for_log = 0.0
         ema_psnr_for_log = 0.0
 
-        first_iter = self.current_iteration + 1
         iter_rng = range(first_iter, n_iter + 1)
 
         if verbose:
@@ -309,28 +382,58 @@ class Trainer:
                 elif 'ss' in tr_render_opt:
                     tr_render_opt.pop('ss')
 
+            # 保存正则化lambda的最终值
+            if not hasattr(cfg.regularizer, "_ge_final"):
+                cfg.regularizer._ge_final = float(cfg.regularizer.lambda_ge_density)
+            if not hasattr(cfg.regularizer, "_ls_final"):
+                cfg.regularizer._ls_final = float(cfg.regularizer.lambda_ls_density)
+            
+            # 更新log_s学习率（在特定迭代）
+            if iteration == 10000:
+                for param_group in self.voxel_model.optimizer.param_groups:
+                    if param_group.get('name') == 'log_s':
+                        target_lr = cfg.optimizer.log_s_lr
+                        param_group['lr'] = target_lr
+                        print(f"\n[INFO] Iteration {iteration}: `log_s` learning rate changed to {target_lr}\n")
+                        break
+            
+            # 增加log_s值（std_increase）
+            first_prune = cfg.procedure.prune_from
+            prune_every = cfg.procedure.prune_every
+            std_increase_rate = 0.07 / (prune_every * 2)
+            if 1 <= iteration < 10000:
+                with torch.no_grad():
+                    if hasattr(self.voxel_model, '_log_s'):
+                        self.voxel_model._log_s.add_(std_increase_rate)
+            
+            if iteration % 100 == 0 and hasattr(self.voxel_model, '_log_s'):
+                print(f"iteration {iteration} log_s = {self.voxel_model._log_s.item():.9f}")
+
             # 确定需要的输出
             need_sparse_depth = cfg.regularizer.lambda_sparse_depth > 0 and sparse_depth_loss.is_active(iteration)
+            need_depthanythingv2 = cfg.regularizer.lambda_depthanythingv2 > 0 and depthanythingv2_loss.is_active(iteration)
+            need_mast3r_metric_depth = cfg.regularizer.lambda_mast3r_metric_depth > 0 and mast3r_metric_depth_loss.is_active(iteration)
             need_nd_loss = cfg.regularizer.lambda_normal_dmean > 0 and nd_loss.is_active(iteration)
             need_nmed_loss = cfg.regularizer.lambda_normal_dmed > 0 and nmed_loss.is_active(iteration)
-
+            need_pi3_normal_loss = cfg.regularizer.lambda_pi3_normal > 0 and pi3_normal_loss.is_active(iteration)
+            
             tr_render_opt['output_T'] = (
                 cfg.regularizer.lambda_T_concen > 0 or
                 cfg.regularizer.lambda_T_inside > 0 or
                 cfg.regularizer.lambda_mask > 0 or
-                need_sparse_depth or need_nd_loss
+                need_sparse_depth or need_nd_loss or need_depthanythingv2 or need_mast3r_metric_depth
             )
-            tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss
-            tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss
+            tr_render_opt['output_normal'] = need_nd_loss or need_nmed_loss or need_pi3_normal_loss
+            tr_render_opt['output_depth'] = need_sparse_depth or need_nd_loss or need_nmed_loss or need_depthanythingv2 or need_mast3r_metric_depth
 
             if iteration >= cfg.regularizer.dist_from and cfg.regularizer.lambda_dist:
                 tr_render_opt['lambda_dist'] = cfg.regularizer.lambda_dist
 
-            if iteration >= cfg.regularizer.ascending_from and cfg.regularizer.lambda_ascending:
+            if iteration >= cfg.regularizer.ascending_from and iteration <= cfg.regularizer.ascending_until and cfg.regularizer.lambda_ascending:
                 tr_render_opt['lambda_ascending'] = cfg.regularizer.lambda_ascending
 
             # 更新自动曝光
-            if cfg.auto_exposure.enable and iteration in cfg.auto_exposure.auto_exposure_upd_ckpt:
+            if cfg.auto_exposure.enable and iteration in cfg.procedure.auto_exposure_upd_ckpt:
                 for cam in self.train_cameras:
                     with torch.no_grad():
                         ref = self.voxel_model.render(cam, ss=1.0)['color']
@@ -349,57 +452,140 @@ class Trainer:
             render_image = render_pkg['color']
 
             # 计算损失
-            mse = loss_utils.l2_loss(render_image, gt_image)
+            gt_image_modified = gt_image
+            mse = loss_utils.l2_loss(render_image, gt_image_modified)
 
             if cfg.regularizer.use_l1:
-                photo_loss = loss_utils.l1_loss(render_image, gt_image)
+                photo_loss = loss_utils.l1_loss(render_image, gt_image_modified)
             elif cfg.regularizer.use_huber:
-                photo_loss = loss_utils.huber_loss(render_image, gt_image, cfg.regularizer.huber_thres)
+                photo_loss = loss_utils.huber_loss(render_image, gt_image_modified, cfg.regularizer.huber_thres)
             else:
                 photo_loss = mse
 
-            loss = cfg.regularizer.lambda_photo * photo_loss
+            loss_photo = cfg.regularizer.lambda_photo * photo_loss
+            loss = loss_photo
+            loss_dict = {"photo": loss_photo}
 
-            if need_sparse_depth:
-                loss += cfg.regularizer.lambda_sparse_depth * sparse_depth_loss(cam, render_pkg)
-
-            if cfg.regularizer.lambda_mask and cam.mask is not None:
-                gt_T = 1 - cam.mask.cuda()
-                loss += cfg.regularizer.lambda_mask * loss_utils.l2_loss(render_pkg['T'], gt_T)
+            # depthanythingv2 loss
+            if need_depthanythingv2:
+                loss_depthanythingv2 = cfg.regularizer.lambda_depthanythingv2 * depthanythingv2_loss(cam, render_pkg, iteration)
+                loss += loss_depthanythingv2
+                loss_dict["depthanythingv2"] = loss_depthanythingv2
 
             if cfg.regularizer.lambda_ssim:
-                loss += cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
+                loss_ssim = cfg.regularizer.lambda_ssim * loss_utils.fast_ssim_loss(render_image, gt_image)
+                loss += loss_ssim
+                loss_dict["ssim"] = loss_ssim
 
             if cfg.regularizer.lambda_T_concen:
-                loss += cfg.regularizer.lambda_T_concen * loss_utils.prob_concen_loss(render_pkg['raw_T'])
+                loss_T_concen = cfg.regularizer.lambda_T_concen * loss_utils.prob_concen_loss(render_pkg['raw_T'])
+                loss += loss_T_concen
+                loss_dict["T_concen"] = loss_T_concen
 
             if cfg.regularizer.lambda_T_inside:
-                loss += cfg.regularizer.lambda_T_inside * render_pkg['raw_T'].square().mean()
+                loss_T_inside = cfg.regularizer.lambda_T_inside * render_pkg['raw_T'].square().mean()
+                loss += loss_T_inside
+                loss_dict["T_inside"] = loss_T_inside
 
             if need_nd_loss:
-                loss += cfg.regularizer.lambda_normal_dmean * nd_loss(cam, render_pkg, iteration)
+                loss_nd_loss = cfg.regularizer.lambda_normal_dmean * nd_loss(cam, render_pkg, iteration)
+                loss += loss_nd_loss
+                loss_dict["nd_loss"] = loss_nd_loss
 
             if need_nmed_loss:
-                loss += cfg.regularizer.lambda_normal_dmed * nmed_loss(cam, render_pkg, iteration)
+                loss_nmed_loss = cfg.regularizer.lambda_normal_dmed * nmed_loss(cam, render_pkg, iteration)
+                loss += loss_nmed_loss
+                loss_dict["nmed_loss"] = loss_nmed_loss
+
+            if need_pi3_normal_loss:
+                lambda_pi3_mult = cfg.regularizer.pi3_normal_decay_mult ** (iteration // cfg.regularizer.pi3_normal_decay_every)
+                loss_pi3_normal = cfg.regularizer.lambda_pi3_normal * lambda_pi3_mult * pi3_normal_loss(cam, render_pkg, iteration)
+                loss += loss_pi3_normal
+                loss_dict["pi3_normal_loss"] = loss_pi3_normal
+
+            # 打印损失分解
+            if iteration % 100 == 0:
+                print(f"[iter {iteration}] loss breakdown:")
+                for name, val in loss_dict.items():
+                    v = val.item()
+                    isn = torch.isnan(val)
+                    print(f"   {name:15s}: {v:.6e}{'  <-- NaN !!' if isn else ''}")
+
+            # 检查NaN
+            if torch.isnan(loss):
+                print(f"[iter {iteration}] 警告: NaN detected in TOTAL loss!")
+                for name, val in loss_dict.items():
+                    if torch.isnan(val):
+                        print(f"   -> NaN found in {name}_loss")
 
             # 反向传播
-            self.optimizer.zero_grad(set_to_none=True)
+            self.voxel_model.optimizer.zero_grad(set_to_none=True)
             loss.backward()
 
-            # TV正则化
-            if (cfg.regularizer.lambda_tv_density and
-                iteration >= cfg.regularizer.tv_from and
-                iteration <= cfg.regularizer.tv_until):
-                self.voxel_model.apply_tv_on_density_field(cfg.regularizer.lambda_tv_density)
+            # 打印voxel统计信息
+            if iteration % 100 == 0:
+                with torch.no_grad():
+                    nonleaf_mask = (~self.voxel_model.is_leaf.view(-1).bool())
+                    levels = self.voxel_model.octlevel.view(-1).to(torch.int64)
+                    levels_nonleaf = levels[nonleaf_mask]
+                    if levels_nonleaf.numel() == 0:
+                        print("  [voxels] non-leaf: 0")
+                    else:
+                        uniq_lvls, counts = torch.unique(levels_nonleaf, return_counts=True)
+                        order = torch.argsort(uniq_lvls)
+                        uniq_lvls = uniq_lvls[order].tolist()
+                        counts = counts[order].tolist()
+                        total_nonleaf = int(sum(counts))
+                        print(f"  [voxels] non-leaf total: {total_nonleaf}")
+                        for L, C in zip(uniq_lvls, counts):
+                            print(f"    - level {L-cfg.bounding.outside_level}: {C}")
+
+            # Grid-level正则化（在backward之后）
+            self._apply_grid_regularization(iteration, grid_voxel_coord, grid_voxel_size, max_voxel_level)
 
             # 优化器步骤
-            self.optimizer.step()
+            self.voxel_model.optimizer.step()
 
-            # 自适应剪枝和细分
-            self._adaptive_voxels(iteration)
+            # 学习率warmup
+            if iteration <= cfg.optimizer.n_warmup:
+                rate = iteration / cfg.optimizer.n_warmup
+                for param_group in self.voxel_model.optimizer.param_groups:
+                    param_group["lr"] = rate * param_group["base_lr"]
 
-            # 更新学习率
-            self.scheduler.step()
+            # 特殊处理geo_lr（前100次迭代为0）
+            for pg in self.voxel_model.optimizer.param_groups:
+                if pg.get("name") == "_geo_grid_pts":
+                    if iteration < 100:
+                        pg["lr"] = 0.0
+                        pg["base_lr"] = 0.0
+                    elif iteration == 100:
+                        val = cfg.optimizer.geo_lr
+                        pg["lr"] = val
+                        pg["base_lr"] = val
+
+            # 学习率衰减
+            if iteration in cfg.optimizer.lr_decay_ckpt:
+                for param_group in self.voxel_model.optimizer.param_groups:
+                    ori_lr = param_group["lr"]
+                    param_group["lr"] *= cfg.optimizer.lr_decay_mult
+                    print(f'LR decay of {param_group.get("name", "unknown")}: {ori_lr} => {param_group["lr"]}')
+                cfg.regularizer.lambda_vg_density *= cfg.optimizer.lr_decay_mult
+                cfg.regularizer.lambda_tv_density *= cfg.optimizer.lr_decay_mult
+                cfg.regularizer.lambda_ge_density *= cfg.optimizer.lr_decay_mult
+                cfg.regularizer.lambda_ls_density *= cfg.optimizer.lr_decay_mult
+
+            # 梯度统计（用于subdivision）
+            need_stat = (iteration >= 500 and iteration <= cfg.procedure.subdivide_until)
+            if need_stat:
+                self.voxel_model.subdiv_meta += self.voxel_model._subdiv_p.grad
+
+            # 自适应剪枝和细分（注意：grid_voxel_coord和grid_voxel_size可能会被更新）
+            updated_grid_voxel_coord, updated_grid_voxel_size, updated_max_voxel_level = \
+                self._adaptive_voxels(iteration, subdivide_prop, remain_subdiv_times, grid_voxel_coord, grid_voxel_size, max_voxel_level)
+            if updated_grid_voxel_coord is not None:
+                grid_voxel_coord = updated_grid_voxel_coord
+                grid_voxel_size = updated_grid_voxel_size
+                max_voxel_level = updated_max_voxel_level
 
             iter_end.record()
             torch.cuda.synchronize()
@@ -444,91 +630,319 @@ class Trainer:
         print(f"[INFO] Training completed. Final PSNR: {ema_psnr_for_log:.2f}")
         return True
 
-    def _adaptive_voxels(self, iteration: int) -> None:
-        """自适应voxel剪枝和细分"""
+    def _apply_grid_regularization(
+        self, 
+        iteration: int, 
+        grid_voxel_coord: torch.Tensor,
+        grid_voxel_size: torch.Tensor,
+        max_voxel_level: int
+    ) -> None:
+        """应用grid级别的正则化（TV, VG, GE, LS, Points）"""
+        cfg = self.config
+        
+        # TV正则化
+        grid_reg_interval = iteration >= cfg.regularizer.tv_from and iteration <= cfg.regularizer.tv_until
+        if cfg.regularizer.lambda_tv_density and grid_reg_interval:
+            lambda_tv_mult = cfg.regularizer.tv_decay_mult ** (iteration // cfg.regularizer.tv_decay_every)
+            svraster_cuda.grid_loss_bw.total_variation(
+                grid_pts=self.voxel_model._geo_grid_pts,
+                vox_key=self.voxel_model.vox_key,
+                weight=cfg.regularizer.lambda_tv_density * lambda_tv_mult,
+                vox_size_inv=self.voxel_model.vox_size_inv,
+                no_tv_s=True,
+                tv_sparse=cfg.regularizer.tv_sparse,
+                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Voxel梯度正则化
+        voxel_gradient_interval = iteration >= cfg.regularizer.vg_from and iteration <= cfg.regularizer.vg_until
+        if cfg.regularizer.lambda_vg_density and voxel_gradient_interval:
+            G = self.voxel_model.vox_size_inv.numel()
+            K = int(G * (1.0 - float(cfg.regularizer.vg_drop_ratio)))
+            active_list = torch.randperm(G, device=self.voxel_model.vox_key.device)[:K].to(torch.int32).contiguous()
+            lambda_vg_mult = cfg.regularizer.vg_decay_mult ** (iteration // cfg.regularizer.vg_decay_every) * (G / K)
+            svraster_cuda.grid_loss_bw.voxel_gradient(
+                grid_pts=self.voxel_model._geo_grid_pts,
+                vox_key=self.voxel_model.vox_key,
+                vox_size_inv=self.voxel_model.vox_size_inv,
+                active_list=active_list,
+                weight=cfg.regularizer.lambda_vg_density * lambda_vg_mult,
+                no_tv_s=True,
+                tv_sparse=cfg.regularizer.vg_sparse,
+                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Grid Eikonal正则化
+        grid_eikonal_interval = iteration >= cfg.regularizer.ge_from and iteration <= cfg.regularizer.ge_until
+        if cfg.regularizer.lambda_ge_density and grid_eikonal_interval:
+            lambda_ge_mult = cfg.regularizer.ge_decay_mult ** min(iteration // cfg.regularizer.ge_decay_every, 2)
+            G = self.voxel_model.grid_keys.numel()
+            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
+            active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
+            max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+            vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
+            svraster_cuda.grid_loss_bw.grid_eikonal(
+                grid_pts=self.voxel_model._geo_grid_pts,
+                vox_key=self.voxel_model.vox_key,
+                grid_voxel_coord=grid_voxel_coord,
+                grid_voxel_size=grid_voxel_size.view(-1),
+                grid_res=2**max_voxel_level,
+                grid_mask=self.voxel_model.grid_mask,
+                grid_keys=self.voxel_model.grid_keys,
+                grid2voxel=self.voxel_model.grid2voxel,
+                active_list=active_list,
+                weight=cfg.regularizer.lambda_ge_density * lambda_ge_mult * (G / K),
+                vox_size_inv=vox_size_min_inv,
+                no_tv_s=True,
+                tv_sparse=cfg.regularizer.ge_sparse,
+                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Laplacian平滑正则化
+        laplacian_interval = iteration >= cfg.regularizer.ls_from and iteration <= cfg.regularizer.ls_until
+        if cfg.regularizer.lambda_ls_density and laplacian_interval:
+            lambda_ls_mult = cfg.regularizer.ls_decay_mult ** min(iteration // cfg.regularizer.ls_decay_every, 2)
+            G = self.voxel_model.grid_keys.numel()
+            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
+            active_list = torch.randperm(G, device=self.voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
+            max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+            vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
+            svraster_cuda.grid_loss_bw.laplacian_smoothness(
+                grid_pts=self.voxel_model._geo_grid_pts,
+                vox_key=self.voxel_model.vox_key,
+                grid_voxel_coord=grid_voxel_coord,
+                grid_voxel_size=grid_voxel_size.view(-1),
+                grid_res=2**max_voxel_level,
+                grid_mask=self.voxel_model.grid_mask,
+                grid_keys=self.voxel_model.grid_keys,
+                grid2voxel=self.voxel_model.grid2voxel,
+                active_list=active_list,
+                weight=cfg.regularizer.lambda_ls_density * lambda_ls_mult * (G / K),
+                vox_size_inv=vox_size_min_inv,
+                no_tv_s=True,
+                tv_sparse=cfg.regularizer.ls_sparse,
+                grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+        
+        # Points损失（如果有初始点）
+        if hasattr(self, 'initial_points') and self.initial_points is not None:
+            points_interval = iteration >= cfg.regularizer.points_loss_from and cfg.regularizer.points_loss_until >= iteration
+            if cfg.regularizer.lambda_points_density and points_interval:
+                sample_rate = cfg.regularizer.points_sample_rate
+                num_points = self.initial_points.shape[0]
+                num_sample = max(1, int(num_points * sample_rate))
+                idx = torch.randperm(num_points, device=self.initial_points.device)[:num_sample]
+                sampled_points = self.initial_points[idx]
+                points_in_grid = (sampled_points - (self.voxel_model.scene_center - self.voxel_model.inside_extent*0.5)) / \
+                                self.voxel_model.inside_extent * (2**max_voxel_level)
+                lambda_points_mult = cfg.regularizer.points_loss_decay_mult ** (iteration // cfg.regularizer.points_loss_decay_every)
+                max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+                vox_size_min_inv = 2**max_voxel_level / self.voxel_model.inside_extent
+                svraster_cuda.grid_loss_bw.points_loss(
+                    points_in_grid=points_in_grid,
+                    grid_pts=self.voxel_model._geo_grid_pts,
+                    vox_key=self.voxel_model.vox_key,
+                    grid_voxel_coord=grid_voxel_coord,
+                    grid_voxel_size=grid_voxel_size.view(-1),
+                    grid_res=2**max_voxel_level,
+                    grid_mask=self.voxel_model.grid_mask,
+                    grid_keys=self.voxel_model.grid_keys,
+                    grid2voxel=self.voxel_model.grid2voxel,
+                    weight=cfg.regularizer.lambda_points_density * lambda_points_mult,
+                    vox_size_inv=vox_size_min_inv,
+                    no_tv_s=True,
+                    tv_sparse=cfg.regularizer.points_loss_sparse,
+                    grid_pts_grad=self.voxel_model._geo_grid_pts.grad)
+
+    def _adaptive_voxels(
+        self, 
+        iteration: int,
+        subdivide_prop: float,
+        remain_subdiv_times: int,
+        grid_voxel_coord: torch.Tensor,
+        grid_voxel_size: torch.Tensor,
+        max_voxel_level: int
+    ) -> tuple:
+        """自适应voxel剪枝和细分（匹配train.py的逻辑）"""
         cfg = self.config
 
-        meet_adapt_period = (
-            iteration % cfg.procedure.adapt_every == 0 and
-            iteration >= cfg.procedure.adapt_from and
-            iteration <= cfg.procedure.n_iter - 500
-        )
         need_pruning = (
-            meet_adapt_period and
+            iteration % cfg.procedure.prune_every == 0 and
+            iteration >= cfg.procedure.prune_from and
             iteration <= cfg.procedure.prune_until
         )
+        if iteration == 1:
+            if cfg.procedure.prune_from == 0:
+                need_pruning = True
+        
         need_subdividing = (
-            meet_adapt_period and
+            iteration % cfg.procedure.subdivide_every == 0 and
+            iteration >= cfg.procedure.subdivide_from and
             iteration <= cfg.procedure.subdivide_until and
             self.voxel_model.num_voxels < cfg.procedure.subdivide_max_num
         )
 
-        if not (need_pruning or need_subdividing):
-            return
+        # 最后500次迭代不进行剪枝和细分
+        need_pruning &= (iteration <= cfg.procedure.n_iter - 500)
+        need_subdividing &= (iteration <= cfg.procedure.n_iter - 500)
 
-        # 计算voxel统计
-        stat_pkg = self.voxel_model.compute_training_stat(camera_lst=self.train_cameras)
-        scheduler_state = self.scheduler.state_dict()
+        if need_pruning or need_subdividing:
+            stat_pkg = self.voxel_model.compute_training_stat(camera_lst=self.train_cameras)
+            torch.cuda.empty_cache()
 
         if need_pruning:
             ori_n = self.voxel_model.num_voxels
 
-            prune_thres = np.interp(
-                iteration,
-                xp=[cfg.procedure.adapt_from, cfg.procedure.prune_until],
-                fp=[cfg.procedure.prune_thres_init, cfg.procedure.prune_thres_final])
+            # 计算剪枝阈值
+            prune_all_iter = max(1, cfg.procedure.prune_until - cfg.procedure.prune_every)
+            prune_now_iter = max(0, iteration - cfg.procedure.prune_every)
+            prune_iter_rate = max(0, min(1, prune_now_iter / prune_all_iter))
+            thres_inc = max(0, cfg.procedure.prune_thres_final - cfg.procedure.prune_thres_init)
+            prune_thres = cfg.procedure.prune_thres_init + thres_inc * prune_iter_rate
 
+            # 剪枝voxels
             prune_mask = (stat_pkg['max_w'] < prune_thres).squeeze(1)
+            
+            # SDF模式的特殊剪枝逻辑
+            if cfg.model.density_mode == 'sdf' and iteration >= 1000:
+                sdf_vals = self.voxel_model._geo_grid_pts[self.voxel_model.vox_key]  # [N, 8, 1]
+                signs = (sdf_vals > 0).float()
+                has_surface = (signs.min(dim=1).values != signs.max(dim=1).values).view(-1)
+                min_abs_sdf = sdf_vals.abs().min(dim=1).values.view(-1)
+                global_vox_size_min = self.voxel_model.vox_size.min().item()
+                sdf_thresh = torch.log(torch.tensor(199.0, device=self.voxel_model._log_s.device)) / torch.exp(10 * self.voxel_model._log_s)
+                learning_thickness = sdf_thresh / 2 / global_vox_size_min
+                print(f"true_learning_thickness = {learning_thickness:.4f}")
+                sdf_thresh = max(2*global_vox_size_min, sdf_thresh.item())
+                print(f"augmented_learning_thickness = {sdf_thresh/global_vox_size_min/2:.4f}")
+                prune_mask = (~has_surface) & (min_abs_sdf > sdf_thresh)
+            elif cfg.model.density_mode == 'sdf':
+                sdf_vals = self.voxel_model._geo_grid_pts[self.voxel_model.vox_key]
+                min_abs_sdf = sdf_vals.abs().min(dim=1).values.view(-1)
+                global_vox_size_min = self.voxel_model.vox_size.min().item()
+                sdf_thresh = torch.log(torch.tensor(199.0, device=self.voxel_model._log_s.device)) / torch.exp(10 * self.voxel_model._log_s)
+                learning_thickness = sdf_thresh / 2 / global_vox_size_min
+                print(f"true_learning_thickness = {learning_thickness:.4f}")
+                sdf_thresh = max(2*global_vox_size_min, sdf_thresh.item())
+                print(f"augmented_learning_thickness = {sdf_thresh/global_vox_size_min/2:.4f}")
+                prune_mask = (min_abs_sdf > sdf_thresh)
+            
             self.voxel_model.pruning(prune_mask)
+
+            # 更新统计信息（用于后续细分）
+            kept_idx = (~prune_mask).argwhere().squeeze(1)
+            for k, v in stat_pkg.items():
+                stat_pkg[k] = v[kept_idx]
+
+            if hasattr(self.voxel_model, '_log_s'):
+                print(f"voxel_model._log_s = {self.voxel_model._log_s}")
 
             new_n = self.voxel_model.num_voxels
             print(f'[PRUNING]     {ori_n:7d} => {new_n:7d} (x{new_n/ori_n:.2f};  thres={prune_thres:.4f})')
+            torch.cuda.empty_cache()
 
         if need_subdividing:
             ori_n = self.voxel_model.num_voxels
 
-            min_samp_interval = stat_pkg['min_samp_interval']
-            if need_pruning:
-                min_samp_interval = min_samp_interval[~prune_mask]
+            # 排除一些voxels
+            size_thres = stat_pkg['min_samp_interval'] * cfg.procedure.subdivide_samp_thres
+            large_enough_mask = (self.voxel_model.vox_size * 0.5 > size_thres).squeeze(1)
+            non_finest_mask = self.voxel_model.octlevel.squeeze(1) < svraster_cuda.meta.MAX_NUM_LEVELS
+            if cfg.model.density_mode == 'sdf':
+                non_finest_mask = self.voxel_model.octlevel.squeeze(1) < (svraster_cuda.meta.MAX_NUM_LEVELS - 5 - max(0, 3 - iteration // 2000) + cfg.bounding.outside_level)
+                print(f"max octlevel for sdf: {svraster_cuda.meta.MAX_NUM_LEVELS - 2 - max(0, 3 - iteration // 3000)}")
+            valid_mask = large_enough_mask & non_finest_mask
 
-            # 检查min_samp_interval是否为空或大小不匹配
-            if min_samp_interval.numel() == 0:
-                print(f'[WARNING] min_samp_interval is empty after pruning, skipping subdivision')
-            elif min_samp_interval.shape[0] != self.voxel_model.num_voxels:
-                print(f'[WARNING] min_samp_interval size ({min_samp_interval.shape[0]}) does not match voxel count ({self.voxel_model.num_voxels}), skipping subdivision')
+            # 获取细分优先级
+            priority = self.voxel_model.subdiv_meta.squeeze(1) * valid_mask
+
+            # 计算优先级排名
+            rank = torch.zeros_like(priority)
+            rank[priority.argsort()] = torch.arange(len(priority), dtype=torch.float32, device="cuda")
+
+            # 确定要细分的voxel数量
+            if iteration <= cfg.procedure.subdivide_all_until:
+                thres = -1
             else:
-                # 只有当min_samp_interval有效时才执行细分
-                size_thres = min_samp_interval * cfg.procedure.subdivide_samp_thres
-                large_enough = (self.voxel_model.vox_size * 0.5 > size_thres).squeeze(1)
-                non_finest = self.voxel_model.octlevel.squeeze(1) < svraster_cuda.meta.MAX_NUM_LEVELS
-                valid_mask = large_enough & non_finest
+                thres = rank.quantile(1 - subdivide_prop)
 
-                priority = self.voxel_model.subdivision_priority.squeeze(1) * valid_mask
+            # 计算细分mask
+            subdivide_mask = (rank > thres) & valid_mask
+            outside_mask = ~self.voxel_model.inside_mask
+            subdivide_mask_for_outside = subdivide_mask & outside_mask
+            n_out = int(subdivide_mask_for_outside.sum().item())
+            print(f"[outside subdivide] count = {n_out}")
 
-                if iteration <= cfg.procedure.subdivide_all_until:
-                    thres = -1
+            inside = self.voxel_model.inside_mask
+            candidates = valid_mask & inside
+
+            if iteration <= cfg.procedure.subdivide_all_until:
+                subdivide_mask = candidates
+            else:
+                prio = self.voxel_model.subdiv_meta.squeeze(1)
+                prio_inside = prio[candidates]
+                if prio_inside.numel() == 0:
+                    subdivide_mask = torch.zeros_like(candidates)
                 else:
-                    thres = priority.quantile(1 - cfg.procedure.subdivide_prop)
+                    thres = torch.quantile(prio_inside, 1 - subdivide_prop)
+                    subdivide_mask = candidates & (prio >= thres) | subdivide_mask_for_outside
 
-                subdivide_mask = (priority > thres) & valid_mask
+            # SDF模式的特殊细分逻辑
+            if cfg.model.density_mode == 'sdf' and iteration < 6000:
+                with torch.no_grad():
+                    sdf_vals = self.voxel_model._geo_grid_pts[self.voxel_model.vox_key]
+                    signs = (sdf_vals > 0).float()
+                    has_surface = (signs.min(dim=1).values != signs.max(dim=1).values).view(-1)
+                cur_level = self.voxel_model.octlevel.squeeze(1)
+                max_level = 9 + cfg.bounding.outside_level - max(0, 2 - iteration // 2000)
+                under_level = cur_level < max_level
+                valid_mask = has_surface & under_level
+                subdivide_mask = (valid_mask & self.voxel_model.is_leaf.squeeze(1) & self.voxel_model.inside_mask) | (subdivide_mask_for_outside & valid_mask)
+                if iteration <= cfg.procedure.subdivide_all_until:
+                    subdivide_mask = under_level
 
-                max_n_subdiv = round((cfg.procedure.subdivide_max_num - self.voxel_model.num_voxels) / 7)
-                if subdivide_mask.sum() > max_n_subdiv:
-                    n_removed = subdivide_mask.sum() - max_n_subdiv
-                    subdivide_mask &= (priority > priority[subdivide_mask].sort().values[n_removed - 1])
+            if hasattr(self.voxel_model, '_log_s'):
+                print(f"voxel_model._log_s = {self.voxel_model._log_s}")
 
-                self.voxel_model.subdividing(subdivide_mask)
+            # 如果voxel数量超过阈值，限制细分数量
+            max_n_subdiv = round((cfg.procedure.subdivide_max_num - self.voxel_model.num_voxels) / 7)
+            if subdivide_mask.sum() > max_n_subdiv:
+                n_removed = subdivide_mask.sum() - max_n_subdiv
+                subdivide_mask &= (rank > rank[subdivide_mask].sort().values[n_removed - 1])
 
-                new_n = self.voxel_model.num_voxels
-                in_p = self.voxel_model.inside_mask.float().mean().item()
-                print(f'[SUBDIVIDING] {ori_n:7d} => {new_n:7d} (x{new_n/ori_n:.2f}; inside={in_p*100:.1f}%)')
+            # 执行细分
+            if subdivide_mask.sum() > 0:
+                self.voxel_model.subdividing(subdivide_mask, cfg.procedure.subdivide_save_gpu)
+            
+            new_n = self.voxel_model.num_voxels
+            in_p = self.voxel_model.inside_mask.float().mean().item()
+            print(f'[SUBDIVIDING] {ori_n:7d} => {new_n:7d} (x{new_n/ori_n:.2f}; inside={in_p*100:.1f}%)')
+            max_voxel_level = self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level
+            print(f'level max : {max_voxel_level}')
+            self.voxel_model.subdiv_meta.zero_()  # 重置subdiv meta
+            remain_subdiv_times -= 1
+            torch.cuda.empty_cache()
 
-                self.voxel_model.reset_subdivision_priority()
+        # 更新grid相关参数（如果进行了剪枝或细分）
+        if need_pruning or need_subdividing:
+            max_voxel_level = min(self.voxel_model.octlevel.max().item() - cfg.bounding.outside_level, 9)
+            grid_voxel_coord = ((self.voxel_model.vox_center - self.voxel_model.vox_size * 0.5) - 
+                              (self.voxel_model.scene_center - self.voxel_model.inside_extent * 0.5)) / \
+                              self.voxel_model.inside_extent * (2**max_voxel_level)
+            grid_voxel_coord = torch.round(grid_voxel_coord).float()
+            grid_voxel_size = (self.voxel_model.vox_size / self.voxel_model.inside_extent) * (2**max_voxel_level)
+            grid_voxel_size = torch.round(grid_voxel_size).float()
 
-        # 重新创建优化器
-        self.optimizer, self.scheduler = self._create_optimizer()
-        self.scheduler.load_state_dict(scheduler_state)
-        torch.cuda.empty_cache()
+            self.voxel_model.grid_mask, self.voxel_model.grid_keys, self.voxel_model.grid2voxel = \
+                octree_utils.update_valid_gradient_table(
+                    cfg.model.density_mode,
+                    self.voxel_model.vox_center,
+                    self.voxel_model.vox_size,
+                    self.voxel_model.scene_center,
+                    self.voxel_model.inside_extent,
+                    max_voxel_level,
+                    self.voxel_model.is_leaf
+                )
+            torch.cuda.synchronize()
+            return grid_voxel_coord, grid_voxel_size, max_voxel_level
+        
+        return None, None, None
 
     def render(
         self,

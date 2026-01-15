@@ -5,10 +5,13 @@ from dataclasses import dataclass, field
 @dataclass
 class ModelConfig:
     """模型配置"""
-    n_samp_per_vox: int = 1              # 每个访问的voxel采样的点数
-    sh_degree: int = 1                    # 使用 3 * (k+1)^2 个参数表示视角相关的颜色
+    vox_geo_mode: str = "triinterp1"      # Voxel几何模式
+    density_mode: str = "exp_linear_11"  # 密度表示模式
+    sh_degree: int = 3                    # 使用 3 * (k+1)^2 个参数表示视角相关的颜色
     ss: float = 1.5                       # 超采样率，用于抗锯齿
-    white_background: bool = True         # 假设白色背景
+    outside_level: int = 5                # 主要3D区域外的Octree层级数
+    model_path: str = ""                  # 模型保存路径
+    white_background: bool = False        # 假设白色背景
     black_background: bool = False        # 假设黑色背景
 
 
@@ -36,10 +39,13 @@ class OptimizerConfig:
     geo_lr: float = 0.025                 # 几何学习率
     sh0_lr: float = 0.010                 # SH0学习率
     shs_lr: float = 0.00025               # 高阶SH学习率
+    log_s_lr: float = 0.001               # log_s学习率
 
     optim_beta1: float = 0.1              # Adam beta1
     optim_beta2: float = 0.99             # Adam beta2
     optim_eps: float = 1e-15              # Adam epsilon
+
+    n_warmup: int = 100                   # 学习率warmup迭代次数
 
     lr_decay_ckpt: List[int] = field(default_factory=lambda: [19000])
     lr_decay_mult: float = 0.1
@@ -73,46 +79,93 @@ class RegularizerConfig:
     # Mast3r度量深度损失
     lambda_mast3r_metric_depth: float = 0.0
     mast3r_repo_path: str = ''
-    mast3r_metric_depth_from: int = 0
+    mast3r_metric_depth_from: int = 3000
     mast3r_metric_depth_end: int = 20000
     mast3r_metric_depth_end_mult: float = 0.01
 
     # 最终透射率应集中到0或1
-    lambda_T_concen: float = 0.1
+    lambda_T_concen: float = 0.0
 
     # 最终透射率应为0
-    lambda_T_inside: float = 0.01
+    lambda_T_inside: float = 0.0
 
     # 每点RGB损失
     lambda_R_concen: float = 0.01
 
     # 几何正则化
-    lambda_ascending: float = 0.01
+    lambda_ascending: float = 0.0
     ascending_from: int = 0
+    ascending_until: int = 2000
 
     # 分布损失（鼓励分布在射线上集中）
     lambda_dist: float = 0.1
     dist_from: int = 10000
 
     # 渲染法线与期望深度导出法线的一致性损失
-    lambda_normal_dmean: float = 0.001
-    n_dmean_from: int = 10_000
+    lambda_normal_dmean: float = 0.0
+    n_dmean_from: int = 2_000
     n_dmean_end: int = 20_000
     n_dmean_ks: int = 3
     n_dmean_tol_deg: float = 90.0
 
     # 渲染法线与中值深度导出法线的一致性损失
-    lambda_normal_dmed: float = 0.01
-    n_dmed_from: int = 3000
+    lambda_normal_dmed: float = 0.0
+    n_dmed_from: int = 2000
     n_dmed_end: int = 20_000
 
+    # Pi3法线损失
+    lambda_pi3_normal: float = 0.1
+    pi3_normal_from: int = 0
+    pi3_normal_end: int = 4000
+    pi3_normal_decay_every: int = 2000
+    pi3_normal_decay_mult: float = 1.0
+
     # 密度网格的总变分损失
-    lambda_tv_density: float = 1e-10
+    lambda_tv_density: float = 1e-8
     tv_from: int = 0
     tv_until: int = 10000
+    tv_decay_every: int = 1000
+    tv_decay_mult: float = 0.8
+    tv_sparse: bool = False
+
+    # Voxel梯度损失
+    lambda_vg_density: float = 1e-11
+    vg_from: int = 6000
+    vg_until: int = 8000
+    vg_decay_every: int = 2000
+    vg_decay_mult: float = 0.25
+    vg_sparse: bool = False
+    vg_drop_ratio: float = 0.5
+
+    # 网格Eikonal损失
+    lambda_ge_density: float = 2e-8
+    ge_from: int = 0
+    ge_until: int = 6000
+    ge_decay_every: int = 2000
+    ge_decay_mult: float = 0.25
+    ge_sparse: bool = False
+    ge_drop_ratio: float = 0.0
+
+    # Laplacian平滑损失
+    lambda_ls_density: float = 1e-10
+    ls_from: int = 0
+    ls_until: int = 8000
+    ls_decay_every: int = 2000
+    ls_decay_mult: float = 0.25
+    ls_sparse: bool = False
+    ls_drop_ratio: float = 0.0
+
+    # 点损失
+    lambda_points_density: float = 0.0
+    points_loss_from: int = 0
+    points_loss_until: int = 4000
+    points_loss_decay_every: int = 2000
+    points_loss_decay_mult: float = 1.0
+    points_loss_sparse: bool = False
+    points_sample_rate: float = 0.05
 
     # 数据增强
-    ss_aug_max: float = 1.5
+    ss_aug_max: float = 1
     rand_bg: bool = False
 
 
@@ -123,42 +176,54 @@ class InitConfig:
     geo_init: float = -10.0               # 预激活密度初始值
     sh0_init: float = 0.5                 # Voxel颜色初始值，范围0~1
     shs_init: float = 0.0                 # 高阶SH系数初始值
+    log_s_init: float = 0.3               # log_s初始值
 
     sh_degree_init: int = 3               # 初始激活的SH阶数
 
     # 通过密集voxel初始化主要内部区域
     init_n_level: int = 6                 # (2^6)^3 个voxels
 
-    # 外部（背景区域）的voxel比例
+    # 外部（背景区域）的初始化策略
+    # none: 外部区域无voxels
+    # uniform[N]: 每个shell层级细分N次，例如uniform1, uniform2, uniform3
+    # heuristic: 基于init_out_ratio初始化固定数量的voxels
+    outside_mode: str = "heuristic"
     init_out_ratio: float = 2.0
+
+    # 如果给定则应用aabb裁剪
+    aabb_crop: bool = False
+
+    # 是否初始化稀疏点
+    init_sparse_points: bool = True
 
 
 @dataclass
 class ProcedureConfig:
     """训练流程配置"""
     # 调度
-    n_iter: int = 20_000                  # 总迭代次数
+    n_iter: int = 10_000                  # 总迭代次数
     sche_mult: float = 1.0                # 调度乘数
     seed: int = 3721                      # 随机种子
 
     # 重置SH
     reset_sh_ckpt: List[int] = field(default_factory=lambda: [-1])
 
-    # 自适应通用设置
-    adapt_from: int = 1000
-    adapt_every: int = 1000
-
     # 自适应voxel剪枝
+    prune_from: int = 1000
+    prune_every: int = 1000
     prune_until: int = 18000
     prune_thres_init: float = 0.0001
-    prune_thres_final: float = 0.05
+    prune_thres_final: float = 0.03
 
     # 自适应voxel细分
-    subdivide_until: int = 15000
-    subdivide_all_until: int = 0
+    subdivide_from: int = 1000
+    subdivide_every: int = 1000
+    subdivide_until: int = 9000
     subdivide_samp_thres: float = 1.0     # voxel最大采样率应大于此值
-    subdivide_prop: float = 0.05
+    subdivide_target_scale: float = 90.0   # 细分目标缩放
     subdivide_max_num: int = 10_000_000
+    subdivide_all_until: int = 0          # 在此迭代之前细分所有有效voxels
+    subdivide_save_gpu: bool = False      # 细分时是否节省GPU内存
 
 
 @dataclass
@@ -166,6 +231,23 @@ class AutoExposureConfig:
     """自动曝光配置"""
     enable: bool = False
     auto_exposure_upd_ckpt: List[int] = field(default_factory=lambda: [5000, 10000, 15000])
+
+
+@dataclass
+class DataConfig:
+    """数据配置"""
+    source_path: str = ""
+    images: str = "images"
+    res_downscale: float = 0.0
+    res_width: int = 0
+    extension: str = ".png"
+    blend_mask: bool = True
+    depth_paths: str = ""
+    normal_paths: str = ""
+    depth_scale: float = 1.0
+    data_device: str = "cpu"
+    eval: bool = False
+    test_every: int = 8
 
 
 @dataclass
@@ -185,6 +267,7 @@ class OutputConfig:
 class TrainerConfig:
     """Trainer 完整配置"""
     model: ModelConfig = field(default_factory=ModelConfig)
+    data: DataConfig = field(default_factory=DataConfig)
     bounding: BoundingConfig = field(default_factory=BoundingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     regularizer: RegularizerConfig = field(default_factory=RegularizerConfig)
@@ -223,8 +306,8 @@ class TrainerConfig:
             setattr(self.regularizer, key, round(getattr(self.regularizer, key) * sche_mult))
 
         # 调整流程相关迭代
-        for key in ['n_iter', 'adapt_from', 'adapt_every',
-                    'prune_until', 'subdivide_until', 'subdivide_all_until']:
+        for key in ['n_iter', 'prune_from', 'prune_every', 'prune_until',
+                    'subdivide_from', 'subdivide_every', 'subdivide_until', 'subdivide_all_until']:
             setattr(self.procedure, key, round(getattr(self.procedure, key) * sche_mult))
 
         # 调整重置SH检查点
