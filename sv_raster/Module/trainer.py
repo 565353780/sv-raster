@@ -785,7 +785,15 @@ class Trainer:
         vox_size = octree_utils.level_2_vox_size(self.voxel_model.scene_extent, vox_level).item()
         iso_alpha = torch.tensor(0.5, device="cuda")
         iso_density = activation_utils.alpha2density(iso_alpha, vox_size)
-        iso = getattr(activation_utils, f"{self.voxel_model.density_mode}_inverse")(iso_density)
+        
+        # Get density_mode, default to EXP_LINEAR_11 if not present
+        # According to CUDA code, density_mode is always EXP_LINEAR_11_MODE
+        density_mode = getattr(self.voxel_model, 'density_mode', 'EXP_LINEAR_11_MODE')
+        # Remove _MODE suffix if present and convert to lowercase
+        if density_mode.endswith('_MODE'):
+            density_mode = density_mode[:-5]
+        density_mode = density_mode.lower()
+        iso = getattr(activation_utils, f"{density_mode}_inverse")(iso_density)
 
         sign = -1
 
