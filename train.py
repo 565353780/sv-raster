@@ -580,7 +580,7 @@ def training(args):
                     f"max: {torch.max(diff).item():.6e}",   # 筌ㅼ뮆占쏙옙揶쏉옙
                     f"rms: {rms:.6e}"                       # 占쎌젫��④퉲猷딀뉩占�
                 )
-        
+
         grid_eikonal_interval = iteration >= cfg.regularizer.ge_from and iteration <= cfg.regularizer.ge_until
         if cfg.regularizer.lambda_ge_density and grid_eikonal_interval:
             # if iteration == 3000:
@@ -589,25 +589,27 @@ def training(args):
             # breakpoint()
             lambda_ge_mult = cfg.regularizer.ge_decay_mult ** min(iteration // cfg.regularizer.ge_decay_every, 2)
             G = voxel_model.grid_keys.numel()
-            K =  int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
-            active_list = torch.randperm(G, device=voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
-            max_voxel_level = min(voxel_model.octlevel.max().item()-cfg.model.outside_level, 9)
-            vox_size_min_inv = 2**max_voxel_level / voxel_model.inside_extent
-            svraster_cuda.grid_loss_bw.grid_eikonal(
-                grid_pts=voxel_model._geo_grid_pts,
-                vox_key=voxel_model.vox_key,
-                grid_voxel_coord=grid_voxel_coord,
-                grid_voxel_size=grid_voxel_size.view(-1),
-                grid_res= 2**max_voxel_level,
-                grid_mask=voxel_model.grid_mask,
-                grid_keys= voxel_model.grid_keys,
-                grid2voxel=voxel_model.grid2voxel,
-                active_list=active_list,
-                weight=cfg.regularizer.lambda_ge_density * lambda_ge_mult * (G / K),
-                vox_size_inv=vox_size_min_inv,
-                no_tv_s=True,
-                tv_sparse=cfg.regularizer.ge_sparse,
-                grid_pts_grad=voxel_model._geo_grid_pts.grad)
+            K = int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
+            # 避免除零错误：如果K为0或G为0，跳过此正则化
+            if K > 0 and G > 0:
+                active_list = torch.randperm(G, device=voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
+                max_voxel_level = min(voxel_model.octlevel.max().item()-cfg.model.outside_level, 9)
+                vox_size_min_inv = 2**max_voxel_level / voxel_model.inside_extent
+                svraster_cuda.grid_loss_bw.grid_eikonal(
+                    grid_pts=voxel_model._geo_grid_pts,
+                    vox_key=voxel_model.vox_key,
+                    grid_voxel_coord=grid_voxel_coord,
+                    grid_voxel_size=grid_voxel_size.view(-1),
+                    grid_res= 2**max_voxel_level,
+                    grid_mask=voxel_model.grid_mask,
+                    grid_keys= voxel_model.grid_keys,
+                    grid2voxel=voxel_model.grid2voxel,
+                    active_list=active_list,
+                    weight=cfg.regularizer.lambda_ge_density * lambda_ge_mult * (G / K),
+                    vox_size_inv=vox_size_min_inv,
+                    no_tv_s=True,
+                    tv_sparse=cfg.regularizer.ge_sparse,
+                    grid_pts_grad=voxel_model._geo_grid_pts.grad)
             # if iteration == 1000:
             #     print("Eikonal loss applied (after)")
             qwer = voxel_model._geo_grid_pts.grad * 10000
@@ -630,24 +632,26 @@ def training(args):
             lambda_ls_mult = cfg.regularizer.ls_decay_mult ** min(iteration // cfg.regularizer.ls_decay_every, 2)
             G = voxel_model.grid_keys.numel()
             K =  int(G * (1.0 - float(cfg.regularizer.ls_drop_ratio)))
-            active_list = torch.randperm(G, device=voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
-            max_voxel_level = min(voxel_model.octlevel.max().item()-cfg.model.outside_level, 9)
-            vox_size_min_inv = 2**max_voxel_level / voxel_model.inside_extent
-            svraster_cuda.grid_loss_bw.laplacian_smoothness(
-                grid_pts=voxel_model._geo_grid_pts,
-                vox_key=voxel_model.vox_key,
-                grid_voxel_coord=grid_voxel_coord,
-                grid_voxel_size=grid_voxel_size.view(-1),
-                grid_res= 2**max_voxel_level,
-                grid_mask=voxel_model.grid_mask,
-                grid_keys= voxel_model.grid_keys,
-                grid2voxel=voxel_model.grid2voxel,
-                active_list=active_list,
-                weight=cfg.regularizer.lambda_ls_density * lambda_ls_mult * (G / K),
-                vox_size_inv=vox_size_min_inv,
-                no_tv_s=True,
-                tv_sparse=cfg.regularizer.ls_sparse,
-                grid_pts_grad=voxel_model._geo_grid_pts.grad)
+            # 避免除零错误：如果K为0或G为0，跳过此正则化
+            if K > 0 and G > 0:
+                active_list = torch.randperm(G, device=voxel_model.grid_keys.device)[:K].to(torch.int32).contiguous()
+                max_voxel_level = min(voxel_model.octlevel.max().item()-cfg.model.outside_level, 9)
+                vox_size_min_inv = 2**max_voxel_level / voxel_model.inside_extent
+                svraster_cuda.grid_loss_bw.laplacian_smoothness(
+                    grid_pts=voxel_model._geo_grid_pts,
+                    vox_key=voxel_model.vox_key,
+                    grid_voxel_coord=grid_voxel_coord,
+                    grid_voxel_size=grid_voxel_size.view(-1),
+                    grid_res= 2**max_voxel_level,
+                    grid_mask=voxel_model.grid_mask,
+                    grid_keys= voxel_model.grid_keys,
+                    grid2voxel=voxel_model.grid2voxel,
+                    active_list=active_list,
+                    weight=cfg.regularizer.lambda_ls_density * lambda_ls_mult * (G / K),
+                    vox_size_inv=vox_size_min_inv,
+                    no_tv_s=True,
+                    tv_sparse=cfg.regularizer.ls_sparse,
+                    grid_pts_grad=voxel_model._geo_grid_pts.grad)
             qwer = voxel_model._geo_grid_pts.grad * 10000
             if iteration % 100 == 0:
                 diff = qwer - asdf

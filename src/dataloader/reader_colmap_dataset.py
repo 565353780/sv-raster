@@ -22,14 +22,12 @@ import json
 import natsort
 import numpy as np
 from PIL import Image
-from pathlib import Path
 import glob
+import trimesh
 from torchvision.transforms.functional import to_tensor
 from src.utils.camera_utils import focal2fov
 from .reader_scene_info import CameraInfo, PointCloud, SceneInfo, SFMInitData
 from .colmap_loader import read_extrinsics_text, read_intrinsics_text, \
-                           read_extrinsics_binary, read_intrinsics_binary, \
-                           read_points3D_binary, read_points3D_text, \
                            read_colmap_ply, qvec2rotmat, fetchPly
 
 
@@ -41,16 +39,22 @@ def read_cameras_from_colmap(cam_extrinsics, cam_intrinsics, images_folder, poin
     keys = natsort.natsorted(
         cam_extrinsics.keys(),
         key = lambda i : cam_extrinsics[i].name)
-    
+
     # Parse paths to depth map if given
-    if depth_paths:
+    if os.path.exists(depth_paths):
         depth_paths = natsort.natsorted(glob.glob(depth_paths))
         assert len(depth_paths) == len(keys), "Number of depth maps mismatched."
-    conf_paths = []
-    if normal_paths:
+    else:
+        depth_paths = []
+
+    if os.path.exists(normal_paths):
         normal_paths = natsort.natsorted(glob.glob(normal_paths))
         assert len(normal_paths) == len(keys), "Number of normal maps mismatched."
         conf_paths  = [p.replace("normal", "conf") for p in normal_paths]
+    else:
+        normal_paths = []
+        conf_paths = []
+
     if conf_paths:
         assert len(conf_paths) == len(keys), "Number of confidence maps mismatched."
         print(f"Found {len(conf_paths)} confidence maps.")
@@ -120,9 +124,6 @@ def read_cameras_from_colmap(cam_extrinsics, cam_intrinsics, images_folder, poin
             mask_path = ""
             mask = None
 
-
-
-
         # Load depth if there is
         if depth_paths:
             depth_path = depth_paths[idx]
@@ -130,12 +131,21 @@ def read_cameras_from_colmap(cam_extrinsics, cam_intrinsics, images_folder, poin
         else:
             depth_path = ""
             depth = None
+
         if normal_paths:
             normal_path = normal_paths[idx]
             normal = Image.open(normal_path)
+        else:
+            normal_path = ""
+            normal = None
+
         if conf_paths:
             conf_path = conf_paths[idx]
             conf = to_tensor(Image.open(conf_path).convert('L'))
+        else:
+            conf_path = ""
+            conf = None
+
         # Load sparse depth
         if extr.name in correspondent:
             sparse_pt = points[correspondent[extr.name]]
@@ -150,7 +160,7 @@ def read_cameras_from_colmap(cam_extrinsics, cam_intrinsics, images_folder, poin
                 width=width, height=height,
                 cx_p=None, cy_p=None,
                 image=image, image_path=image_path,
-                depth=depth, depth_path=depth_path, 
+                depth=depth, depth_path=depth_path,
                 normal=normal, normal_path=normal_path,
                 conf=conf, conf_path=conf_path,
                 sparse_pt=sparse_pt,
@@ -170,19 +180,49 @@ def read_colmap_dataset(path, images, eval, test_every=8, depth_paths="", normal
         raise Exception("Can not find COLMAP outcome.")
     sfm_data = None
     # Parse cameras
-    try:
-        cameras_extrinsic_file = os.path.join(sparse_path, "images.bin")
-        cameras_intrinsic_file = os.path.join(sparse_path, "cameras.bin")
-        cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
-    except:
-        cameras_extrinsic_file = os.path.join(sparse_path, "images.txt")
-        cameras_intrinsic_file = os.path.join(sparse_path, "cameras.txt")
-        cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
-        cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
+    cameras_extrinsic_file = os.path.join(sparse_path, "images.txt")
+    cameras_intrinsic_file = os.path.join(sparse_path, "cameras.txt")
+    cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
+    cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
-    # Parse sparse points
-    points, colors, normals, ply_path, correspondent = read_colmap_ply(sparse_path, cam_extrinsics)
+    # Parse sparse points - Read points3D.ply directly using trimesh
+    ply_path = os.path.join(sparse_path, "points3D.ply")
+    cor_path = os.path.join(sparse_path, "points_correspondent.json")
+    
+    if os.path.exists(ply_path):
+        # Read 3D points using trimesh (reference: reader_colmap_dataset1.py)
+        pcd = trimesh.load(ply_path)
+        points = np.array(pcd.vertices, dtype=np.float32)
+        
+        # Extract colors if available
+        if hasattr(pcd, 'visual') and hasattr(pcd.visual, 'vertex_colors'):
+            colors = np.array(pcd.visual.vertex_colors)[:, :3]
+            if colors.max() > 1.0:
+                colors = colors / 255.0
+        elif hasattr(pcd, 'colors') and pcd.colors is not None:
+            colors = np.array(pcd.colors)[:, :3]
+            if colors.max() > 1.0:
+                colors = colors / 255.0
+        else:
+            colors = np.zeros_like(points)
+        
+        # Extract normals if available
+        if hasattr(pcd, 'vertex_normals') and pcd.vertex_normals is not None:
+            normals = np.array(pcd.vertex_normals, dtype=np.float32)
+        else:
+            normals = np.zeros_like(points)
+        
+        # Load correspondent if exists
+        if os.path.exists(cor_path):
+            with open(cor_path) as f:
+                correspondent = json.load(f)
+        else:
+            # If correspondent doesn't exist, try to generate it or use empty dict
+            correspondent = {}
+    else:
+        # Fallback to original read_colmap_ply if points3D.ply doesn't exist
+        points, colors, normals, ply_path, correspondent = read_colmap_ply(sparse_path, cam_extrinsics)
+    
     point_cloud = PointCloud(
         points=points,
         colors=colors,
