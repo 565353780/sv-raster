@@ -8,9 +8,8 @@ pip3 install torch torchvision \
 
 pip install numpy einops yacs tqdm natsort argparse \
   pillow imageio imageio-ffmpeg scikit-image pycolmap \
-  plyfile shapely gpytoolbox lpips pytorch-msssim
+  plyfile shapely gpytoolbox lpips pytorch-msssim opencv-python
 
-pip install opencv-python==4.8.0.74
 pip install opencv-contrib-python==4.8.0.74
 pip install trimesh==4.0.4
 pip install open3d==0.18.0
