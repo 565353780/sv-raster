@@ -1,9 +1,7 @@
 import os
 import cv2
 import torch
-import trimesh
 import numpy as np
-import open3d as o3d
 from tqdm import tqdm
 from copy import deepcopy
 from typing import List, Optional, Union
@@ -15,11 +13,17 @@ from octree_shape.Module.octree_builder import OctreeBuilder
 
 import svraster_cuda
 from src.utils.image_utils import im_tensor2np, viz_tensordepth
+from src.utils import octree_utils
+from src.utils import activation_utils
+from src.utils.marching_cubes_utils import torch_marching_cubes_grid
 
 from sv_raster.Config.config import TrainerConfig, cfg
 from sv_raster.Data.colmap_camera import ColmapCamera
 from sv_raster.Method.io import loadMeshFile
+from sv_raster.Method.path import createFileFolder
 from sv_raster.Model.sparse_voxel import SparseVoxelModel
+
+import trimesh
 
 
 def demo():
@@ -510,32 +514,39 @@ class Trainer:
             if need_pruning:
                 min_samp_interval = min_samp_interval[~prune_mask]
 
-            size_thres = min_samp_interval * cfg.procedure.subdivide_samp_thres
-            large_enough = (self.voxel_model.vox_size * 0.5 > size_thres).squeeze(1)
-            non_finest = self.voxel_model.octlevel.squeeze(1) < svraster_cuda.meta.MAX_NUM_LEVELS
-            valid_mask = large_enough & non_finest
-
-            priority = self.voxel_model.subdivision_priority.squeeze(1) * valid_mask
-
-            if iteration <= cfg.procedure.subdivide_all_until:
-                thres = -1
+            # 检查min_samp_interval是否为空或大小不匹配
+            if min_samp_interval.numel() == 0:
+                print(f'[WARNING] min_samp_interval is empty after pruning, skipping subdivision')
+            elif min_samp_interval.shape[0] != self.voxel_model.num_voxels:
+                print(f'[WARNING] min_samp_interval size ({min_samp_interval.shape[0]}) does not match voxel count ({self.voxel_model.num_voxels}), skipping subdivision')
             else:
-                thres = priority.quantile(1 - cfg.procedure.subdivide_prop)
+                # 只有当min_samp_interval有效时才执行细分
+                size_thres = min_samp_interval * cfg.procedure.subdivide_samp_thres
+                large_enough = (self.voxel_model.vox_size * 0.5 > size_thres).squeeze(1)
+                non_finest = self.voxel_model.octlevel.squeeze(1) < svraster_cuda.meta.MAX_NUM_LEVELS
+                valid_mask = large_enough & non_finest
 
-            subdivide_mask = (priority > thres) & valid_mask
+                priority = self.voxel_model.subdivision_priority.squeeze(1) * valid_mask
 
-            max_n_subdiv = round((cfg.procedure.subdivide_max_num - self.voxel_model.num_voxels) / 7)
-            if subdivide_mask.sum() > max_n_subdiv:
-                n_removed = subdivide_mask.sum() - max_n_subdiv
-                subdivide_mask &= (priority > priority[subdivide_mask].sort().values[n_removed - 1])
+                if iteration <= cfg.procedure.subdivide_all_until:
+                    thres = -1
+                else:
+                    thres = priority.quantile(1 - cfg.procedure.subdivide_prop)
 
-            self.voxel_model.subdividing(subdivide_mask)
+                subdivide_mask = (priority > thres) & valid_mask
 
-            new_n = self.voxel_model.num_voxels
-            in_p = self.voxel_model.inside_mask.float().mean().item()
-            print(f'[SUBDIVIDING] {ori_n:7d} => {new_n:7d} (x{new_n/ori_n:.2f}; inside={in_p*100:.1f}%)')
+                max_n_subdiv = round((cfg.procedure.subdivide_max_num - self.voxel_model.num_voxels) / 7)
+                if subdivide_mask.sum() > max_n_subdiv:
+                    n_removed = subdivide_mask.sum() - max_n_subdiv
+                    subdivide_mask &= (priority > priority[subdivide_mask].sort().values[n_removed - 1])
 
-            self.voxel_model.reset_subdivision_priority()
+                self.voxel_model.subdividing(subdivide_mask)
+
+                new_n = self.voxel_model.num_voxels
+                in_p = self.voxel_model.inside_mask.float().mean().item()
+                print(f'[SUBDIVIDING] {ori_n:7d} => {new_n:7d} (x{new_n/ori_n:.2f}; inside={in_p*100:.1f}%)')
+
+                self.voxel_model.reset_subdivision_priority()
 
         # 重新创建优化器
         self.optimizer, self.scheduler = self._create_optimizer()
@@ -724,3 +735,75 @@ class Trainer:
             print(f"[EVAL] PSNR: {results['psnr']:.2f}, SSIM: {results['ssim']:.4f}")
 
         return results
+
+    @torch.no_grad()
+    def exportMeshFile(
+        self,
+        save_mesh_file_path: str,
+        final_lv: int = 10,
+        bbox_scale: float = 1.0,
+        crop_bbox: Optional[np.ndarray] = None,
+    ) -> bool:
+        """
+        导出mesh文件
+
+        Args:
+            save_mesh_file_path: 保存mesh文件的路径
+            final_lv: 用于marching cubes的最终层级
+            bbox_scale: 边界框缩放因子
+            crop_bbox: 可选的裁剪边界框，形状为 [2, 3]，第一行是最小值，第二行是最大值
+
+        Returns:
+            是否成功
+        """
+        if self.voxel_model is None:
+            print('[ERROR][Trainer::exportMeshFile]')
+            print('\t Model not initialized. Please train or load a model first.')
+            return False
+
+        createFileFolder(save_mesh_file_path)
+
+        # 冻结几何参数
+        self.voxel_model.freeze_vox_geo()
+
+        # 确定边界框
+        if crop_bbox is None:
+            inside_min = self.voxel_model.scene_center - 0.5 * self.voxel_model.inside_extent * bbox_scale
+            inside_max = self.voxel_model.scene_center + 0.5 * self.voxel_model.inside_extent * bbox_scale
+        else:
+            inside_min = torch.tensor(crop_bbox[0], dtype=torch.float32, device="cuda")
+            inside_max = torch.tensor(crop_bbox[1], dtype=torch.float32, device="cuda")
+
+        # 过滤背景voxel
+        inside_mask = ((inside_min <= self.voxel_model.grid_pts_xyz) & 
+                        (self.voxel_model.grid_pts_xyz <= inside_max)).all(-1)
+        inside_mask = inside_mask[self.voxel_model.vox_key].any(-1)
+        inside_idx = torch.where(inside_mask)[0]
+
+        # Infer iso value for level set
+        vox_level = torch.tensor([self.voxel_model.outside_level + final_lv], device="cuda")
+        vox_size = octree_utils.level_2_vox_size(self.voxel_model.scene_extent, vox_level).item()
+        iso_alpha = torch.tensor(0.5, device="cuda")
+        iso_density = activation_utils.alpha2density(iso_alpha, vox_size)
+        iso = getattr(activation_utils, f"{self.voxel_model.density_mode}_inverse")(iso_density)
+
+        sign = -1
+
+        # 执行marching cubes
+        verts, faces = torch_marching_cubes_grid(
+            grid_pts_val=sign * self.voxel_model._geo_grid_pts,
+            grid_pts_xyz=self.voxel_model.grid_pts_xyz,
+            vox_key=self.voxel_model.vox_key[inside_idx],
+            iso=sign * iso)
+
+        # 创建trimesh对象
+        mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
+
+        # 导出mesh
+        mesh.export(save_mesh_file_path)
+        print(f"[EXPORT] Mesh saved to {save_mesh_file_path}")
+        print(f"[EXPORT] Vertices: {len(mesh.vertices)}, Faces: {len(mesh.faces)}")
+
+        # 解冻几何参数
+        self.voxel_model.unfreeze_vox_geo()
+        return True

@@ -178,6 +178,7 @@ class SVAdaptive:
     def sh_degree_add1(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
+            print('sh degree upper to', self.active_sh_degree)
 
     @torch.no_grad()
     def compute_training_stat(self, camera_lst):

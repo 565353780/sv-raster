@@ -44,7 +44,7 @@ def demo():
             white_background=True,
         ),
         procedure=ProcedureConfig(
-            n_iter=10000,
+            n_iter=3000,
             seed=42,
         ),
         init=InitConfig(
@@ -76,4 +76,10 @@ def demo():
         render_image = trainer.render(camera_list[i], output_T=True, output_depth=True, output_normal=True)
         out_path = os.path.join(output_folder, f"{i:06d}.png")
         cv2.imwrite(out_path, render_image)
+
+    trainer.exportMeshFile(
+        save_data_folder_path + "svraster/tsdf_mesh.ply",
+        final_lv=16,
+        bbox_scale=1.0,
+    )
     return trainer
