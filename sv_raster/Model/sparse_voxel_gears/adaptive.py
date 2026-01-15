@@ -8,6 +8,7 @@
 
 import torch
 
+from src.utils import activation_utils
 from src.utils import octree_utils
 
 '''
@@ -28,159 +29,54 @@ There are three types of data mode to tackle.
 class SVAdaptive:
 
     @torch.no_grad()
-    def pruning(self, prune_mask):
+    def pruning(self, prune_mask, renew_states=True):
         '''
-        Prune sparse voxels. The grid points are updated accordingly.
-
+        Prune sparse voxels.
+        The grid points and the optimizer are updated accordingly.
         Input:
             @prune_mask      [N] Mask indicating the voxels to prune.
+            @renew_states    Set to false if you want to renew optimizer in other place.
         '''
-        if len(prune_mask.shape) == 2:
-            assert prune_mask.shape[1] == 1
-            prune_mask = prune_mask.squeeze(1)
-        assert prune_mask.shape == (self.num_voxels, )
         kept_idx = (~prune_mask).argwhere().squeeze(1)
-        if len(kept_idx) == 0:
-            return
-
-        old_vox_key = self.vox_key.clone()
-
-        # Prune non-trainable per-voxel attributes.
-        for name in self.per_voxel_attr_lst:
-            ori_attr = getattr(self, name)
-            new_attr = mask_cat_perm(ori_attr, kept_idx=kept_idx)
-            setattr(self, name, new_attr)
-            if name == '_subdiv_p' and ori_attr.grad is not None:
-                self._subdiv_p.grad = mask_cat_perm(ori_attr.grad, kept_idx=kept_idx)
-                self._subdiv_p.requires_grad_()
-            del ori_attr
-        torch.cuda.empty_cache()
-
-        # Prune trainable per-voxel parameters.
-        for name in self.per_voxel_param_lst:
-            ori_param = getattr(self, name).detach()
-            new_param = mask_cat_perm(
-                ori_param,
-                kept_idx=kept_idx).requires_grad_()
-            setattr(self, name, new_param)
-            del ori_param, new_param
-        torch.cuda.empty_cache()
-
-        # Prune trainable grid points parameters (on voxel corners).
-        for name in self.grid_pts_param_lst:
-            ori_grid_pts = getattr(self, name).detach()
-
-            # Update parameter
-            ori_vox_grid_pts_val = ori_grid_pts[old_vox_key]
-            new_vox_val = mask_cat_perm(
-                ori_vox_grid_pts_val,
-                kept_idx=kept_idx)
-            new_param = agg_voxel_into_grid_pts(
-                self.num_grid_pts,  # It's the updated one
-                self.vox_key,
-                new_vox_val).requires_grad_()
-            setattr(self, name, new_param)
-            del ori_grid_pts, ori_vox_grid_pts_val, new_vox_val, new_param
-        torch.cuda.empty_cache()
+        self.clear_optimizer_states()
+        self._prune_attr(kept_idx)
+        self._prune_voxel_parameters(kept_idx)
+        self._prune_grid_pts_parameters(kept_idx)
+        self.renew_optimizer_states()
 
     @torch.no_grad()
-    def subdividing(self, subdivide_mask):
+    def subdividing(self, subdivide_mask, save_gpu=False, renew_states=True):
         '''
-        Prune sparse voxels. The grid points are updated accordingly.
-
+        Prune sparse voxels.
+        The grid points and the optimizer are updated accordingly.
         Input:
             @subdivide_mask  [N] Mask indicating the voxels to subdivide.
+            @save_gpu        Set to true if you want to save some GPU memory.
+            @renew_states    Set to false if you want to renew optimizer in other place.
         '''
         # Compute voxel index to keep and to subdivided
         if len(subdivide_mask.shape) == 2:
-            assert subdivide_mask.shape[1] == 1
             subdivide_mask = subdivide_mask.squeeze(1)
-        assert subdivide_mask.shape == (self.num_voxels, )
-        kept_idx = (~subdivide_mask).argwhere().squeeze(1)
+        depth_rel = self.octlevel.squeeze(1) - self.outside_level
+        parent_keep_mask = subdivide_mask & (depth_rel >= 9)
+        kept_mask = (~subdivide_mask) | parent_keep_mask
+        kept_idx = kept_mask.nonzero(as_tuple=False).flatten()
         subdivide_idx = subdivide_mask.argwhere().squeeze(1)
-        if len(subdivide_idx) == 0:
-            return
+        parent_idx = parent_keep_mask.argwhere().squeeze(1)
 
-        old_vox_key = self.vox_key.clone()
-
-        # Subdivide non-trainable per-voxel attributes.
-        octpath, octlevel = octree_utils.gen_children(
-            self.octpath[subdivide_idx],
-            self.octlevel[subdivide_idx])
-
-        special_subdiv = dict(
-            octpath=octpath,
-            octlevel=octlevel,
-        )
-
-        for name in self.per_voxel_attr_lst:
-            ori_attr = getattr(self, name)
-            if name in special_subdiv:
-                subdiv_attr = special_subdiv.pop(name)
-            else:
-                subdiv_attr = ori_attr[subdivide_idx].repeat_interleave(8, dim=0)
-            new_attr = mask_cat_perm(
-                ori_attr,
-                kept_idx=kept_idx,
-                cat_tensor=subdiv_attr)
-            setattr(self, name, new_attr)
-            if name == '_subdiv_p' and ori_attr.grad is not None:
-                self._subdiv_p.grad = mask_cat_perm(
-                    ori_attr.grad,
-                    kept_idx=kept_idx,
-                    cat_tensor=subdiv_attr)
-                self._subdiv_p.requires_grad_()
-            del ori_attr, subdiv_attr
-
-        assert len(special_subdiv) == 0
-        torch.cuda.empty_cache()
-
-        # Subdivide trainable per-voxel parameters.
-        for name in self.per_voxel_param_lst:
-            ori_param = getattr(self, name).detach()
-
-            # Update parameter
-            subdiv_param = ori_param[subdivide_idx].repeat_interleave(8, dim=0)
-            new_param = mask_cat_perm(
-                ori_param,
-                kept_idx=kept_idx,
-                cat_tensor=subdiv_param).requires_grad_()
-            setattr(self, name, new_param)
-            del ori_param, subdiv_param, new_param
-        torch.cuda.empty_cache()
-
-        # Subdivide grid points parameters (on voxel corners).
-        for name in self.grid_pts_param_lst:
-            ori_grid_pts = getattr(self, name).detach()
-
-            # Update parameter
-            # First we gather grid_pts values into each voxel first.
-            # The voxel is then subdivided by trilinear interpolation.
-            # Finally, we gather voxel values back to the grid_pts.
-            ori_vox_grid_pts_val = ori_grid_pts[old_vox_key]
-            subdiv_vox_grid_pts_val = subdivide_by_interp(
-                ori_vox_grid_pts_val[subdivide_idx])
-            new_vox_val = mask_cat_perm(
-                ori_vox_grid_pts_val,
-                kept_idx=kept_idx,
-                cat_tensor=subdiv_vox_grid_pts_val)
-            del ori_grid_pts, ori_vox_grid_pts_val, subdiv_vox_grid_pts_val
-
-            new_param = agg_voxel_into_grid_pts(
-                self.num_grid_pts,  # It's the updated one
-                self.vox_key,
-                new_vox_val).cuda().requires_grad_()
-            setattr(self, name, new_param)
-            del new_vox_val, new_param
-        torch.cuda.empty_cache()
+        # Subdivided the selected voxels into their eight octants
+        self.clear_optimizer_states()
+        self._subdivide_attr(kept_idx, subdivide_idx, parent_idx)
+        self._subdivide_voxel_parameters(kept_idx, subdivide_idx)
+        self._subdivide_grid_pts_parameters(kept_idx, subdivide_idx, save_gpu=save_gpu)
+        self.renew_optimizer_states()
 
     @torch.no_grad()
     def sh_degree_add1(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
-            print('sh degree upper to', self.active_sh_degree)
 
-    @torch.no_grad()
+    @torch.no_grad() #PyTorch autograd 엔진을 꺼서 메모리 낭비 없이 연산만 수행하게 함.
     def compute_training_stat(self, camera_lst):
         '''
         Compute the following statistic of each voxel from the given cameras.
@@ -196,16 +92,18 @@ class SVAdaptive:
         min_samp_interval = torch.full([self.num_voxels, 1], 1e30, dtype=torch.float32, device="cuda")
         view_cnt = torch.zeros([self.num_voxels, 1], dtype=torch.float32, device="cuda")
         for camera in camera_lst:
+            #voxel 별로 blending weight를 계산하기 위해서 camera를 render에 넣어줌.
             max_w_i = self.render(camera, color_mode='dontcare', track_max_w=True)['max_w']
             max_w = torch.maximum(max_w, max_w_i)
-
+            #squeeze는 불필요한 차원을 없애주는 함수.
+            #argwhere는 조건에 맞는 인덱스를 반환하는 함수.
             vis_idx = (max_w_i > 0).squeeze().argwhere().squeeze()
             zdist = ((self.vox_center[vis_idx] - camera.position) * camera.lookat).sum(-1, keepdims=True)
             samp_interval = zdist * camera.pix_size
             min_samp_interval[vis_idx] = torch.minimum(min_samp_interval[vis_idx], samp_interval)
 
             view_cnt[vis_idx] += 1
-
+        #근데 사실 이 방법대로 하면 가운데 픽셀들은 samp_interval이 과대평가됨.
         stat_pkg = {
             'max_w': max_w,
             'min_samp_interval': min_samp_interval,
@@ -213,6 +111,222 @@ class SVAdaptive:
         }
         self.unfreeze_vox_geo()
         return stat_pkg
+
+    @torch.no_grad()
+    def clear_optimizer_states(self):
+        if not hasattr(self, 'optimizer'):
+            return
+        for name in self.per_voxel_param_lst + self.grid_pts_param_lst:
+            param = getattr(self, name)
+            del self.optimizer.state[param]
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def renew_optimizer_states(self):
+        if not hasattr(self, 'optimizer'):
+            return
+        lookup = {
+            group['name']: idx
+            for idx, group in enumerate(self.optimizer.param_groups)
+        }
+        for name in self.per_voxel_param_lst + self.grid_pts_param_lst:
+            # WARNING: may cause error if a param is never optimized.
+            group_idx = lookup[name]
+            new_param = getattr(self, name)
+            assert len(self.optimizer.param_groups[group_idx]['params']) == 1
+            self.optimizer.param_groups[group_idx]['params'][0] = new_param
+            self.optimizer.state[new_param] = {}
+            torch.cuda.empty_cache()
+
+    #################################################
+    # The following are the low-level functions for
+    # sparse voxels pruning and subdivision.
+    #################################################
+    @torch.no_grad()
+    def _prune_attr(self, kept_idx):
+        '''
+        Prune non-trainable per-voxel attributes.
+        Input:
+            @kept_idx: the voxels to be kept.
+        '''
+        for name in self.per_voxel_attr_lst:
+            ori_attr = getattr(self, name)
+            new_attr = mask_cat_perm(ori_attr, kept_idx=kept_idx)
+            setattr(self, name, new_attr)
+            del ori_attr
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _subdivide_attr(self, kept_idx, subdivide_idx, parent_idx):
+        '''
+        Subdivide non-trainable per-voxel attributes.
+        Input:
+            @kept_idx: the voxels to be kept.
+            @subdivide_idx: the voxels to be subdivided.
+        '''
+        octpath, octlevel = octree_utils.gen_children(
+            self.octpath[subdivide_idx],
+            self.octlevel[subdivide_idx])
+        vox_center, vox_size = octree_utils.octpath_decoding(
+            octpath,
+            octlevel,
+            self.scene_center,
+            self.scene_extent)
+        #자식들의 ocpath, octlevel, center, size를 생성해서 특별 취급함.
+        special_subdiv = dict(
+            octpath=octpath,
+            octlevel=octlevel,
+            vox_center=vox_center,
+            vox_size=vox_size,
+        )
+        for name in self.per_voxel_attr_lst:
+            ori_attr = getattr(self, name)
+            if name in special_subdiv:
+                subdiv_attr = special_subdiv.pop(name)
+            elif name == 'is_leaf':
+                ori_attr[parent_idx] = False
+                subdiv_attr= torch.ones_like(ori_attr[subdivide_idx]).repeat_interleave(8, dim=0)
+            else:
+                subdiv_attr = ori_attr[subdivide_idx].repeat_interleave(8, dim=0)
+            new_attr = mask_cat_perm(
+                ori_attr,
+                kept_idx=kept_idx,
+                cat_tensor=subdiv_attr)
+            setattr(self, name, new_attr)
+            del ori_attr, subdiv_attr
+            torch.cuda.empty_cache()
+
+        assert len(special_subdiv) == 0
+
+    @torch.no_grad()
+    def _prune_voxel_parameters(self, kept_idx):
+        '''
+        Prune trainable per-voxel parameters.
+        Input:
+            @kept_idx: the voxels to be kept.
+        '''
+
+        # Update voxel trainable parameters
+        for name in self.per_voxel_param_lst:
+            ori_param = getattr(self, name).detach()
+            torch.cuda.empty_cache()
+
+            # Update parameter
+            new_param = mask_cat_perm(
+                ori_param,
+                kept_idx=kept_idx).requires_grad_()
+            setattr(self, name, new_param)
+            del ori_param, new_param
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _subdivide_voxel_parameters(self, kept_idx, subdivide_idx):
+        '''
+        Subdivide trainable per-voxel parameters.
+        Input:
+            @kept_idx: the voxels to be kept.
+            @subdivide_idx: the voxels to be subdivided.
+        '''
+
+        # Update voxel trainable parameters
+        for name in self.per_voxel_param_lst:
+            ori_param = getattr(self, name).detach()
+            torch.cuda.empty_cache()
+
+            # Update parameter
+            subdiv_param = ori_param[subdivide_idx].repeat_interleave(8, dim=0)
+            new_param = mask_cat_perm(
+                ori_param,
+                kept_idx=kept_idx,
+                cat_tensor=subdiv_param).requires_grad_()
+            setattr(self, name, new_param)
+            del ori_param, subdiv_param, new_param
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _prune_grid_pts_parameters(self, kept_idx):
+        '''
+        Prune trainable grid_pts parameters.
+        NOTE: This function assume per-voxel attributes are already updated.
+        Input:
+            @kept_idx: the voxels to be kept.
+        '''
+
+        # Assume per-voxel attributes are already updated.
+        # Re-build the link between voxel and grid_pts.
+        old_vox_key = self.vox_key.clone()
+        new_grid_pts_key, new_vox_key = octree_utils.build_grid_pts_link(self.octpath, self.octlevel)
+        new_num_grid_pts = len(new_grid_pts_key)
+        self.grid_pts_key, self.vox_key = new_grid_pts_key, new_vox_key
+
+        # Update grid_pts parameters from voxel
+        for name in self.grid_pts_param_lst:
+            ori_grid_pts = getattr(self, name).detach()
+            torch.cuda.empty_cache()
+
+            # Update parameter
+            ori_vox_grid_pts_val = ori_grid_pts[old_vox_key]
+            new_vox_val = mask_cat_perm(
+                ori_vox_grid_pts_val,
+                kept_idx=kept_idx)
+            new_param = agg_voxel_into_grid_pts(
+                new_num_grid_pts,
+                new_vox_key,
+                new_vox_val).requires_grad_()
+            setattr(self, name, new_param)
+            del ori_grid_pts, ori_vox_grid_pts_val, new_vox_val, new_param
+            torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def _subdivide_grid_pts_parameters(self, kept_idx, subdivide_idx, save_gpu=False, reset_optim=False):
+        '''
+        Subdivide trainable grid_pts parameters.
+        NOTE: This function assume per-voxel attributes are already updated.
+        Input:
+            @kept_idx: the voxels to be kept.
+            @subdivide_idx: the voxels to be subdivided.
+        '''
+
+        # Assume per-voxel attributes are already updated.
+        # Re-build the link between voxel and grid_pts.
+        old_vox_key = self.vox_key.clone()
+        new_grid_pts_key, new_vox_key = octree_utils.build_grid_pts_link(self.octpath, self.octlevel)
+        new_num_grid_pts = len(new_grid_pts_key)
+        self.grid_pts_key, self.vox_key = new_grid_pts_key, new_vox_key
+
+        if save_gpu:
+            kept_idx = kept_idx.cpu()
+            subdivide_idx = subdivide_idx.cpu()
+            old_vox_key = old_vox_key.cpu()
+
+        # Update grid points parameters from voxel
+        for name in self.grid_pts_param_lst:
+            ori_grid_pts = getattr(self, name).detach()
+            if save_gpu:
+                ori_grid_pts = ori_grid_pts.cpu()
+            torch.cuda.empty_cache()
+
+            # Update parameter
+            # First we gather grid_pts values into each voxel first.
+            # The voxel is then subdivided by trilinear interpolation.
+            # Finally, we gather voxel values back to the grid_pts.
+            ori_vox_grid_pts_val = ori_grid_pts[old_vox_key]
+            subdiv_vox_grid_pts_val = subdivide_by_interp(
+                ori_vox_grid_pts_val[subdivide_idx])
+            new_vox_val = mask_cat_perm(
+                ori_vox_grid_pts_val,
+                kept_idx=kept_idx,
+                cat_tensor=subdiv_vox_grid_pts_val)
+            del ori_grid_pts, ori_vox_grid_pts_val, subdiv_vox_grid_pts_val
+            torch.cuda.empty_cache()
+
+            new_param = agg_voxel_into_grid_pts(
+                new_num_grid_pts,
+                new_vox_key,
+                new_vox_val).cuda().requires_grad_()
+            setattr(self, name, new_param)
+            del new_vox_val, new_param
+            torch.cuda.empty_cache()
 
 
 # Some helpful functions

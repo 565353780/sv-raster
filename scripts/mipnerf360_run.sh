@@ -27,13 +27,13 @@ lanuch_exp() {
 for scene in bonsai counter kitchen room
 do
    echo "============ start " $scene " ============"
-   lanuch_exp $scene $1 --image_dir_name images_2 "${@:2}"
+   lanuch_exp $scene $1 --images images_2 "${@:2}"
    echo "============ end " $scene " ============"
 done
 
 for scene in bicycle garden stump treehill flowers
 do
     echo "============ start " $scene " ============"
-    lanuch_exp $scene $1 --image_dir_name images_4 "${@:2}"
+    lanuch_exp $scene $1 --images images_4 "${@:2}"
     echo "============ end " $scene " ============"
 done

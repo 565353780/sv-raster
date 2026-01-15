@@ -9,6 +9,7 @@
 import os
 import re
 import torch
+from svraster_cuda.meta import MAX_NUM_LEVELS
 
 from src.utils import octree_utils
 
@@ -21,6 +22,7 @@ class SVInOut:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         state_dict = {
             'active_sh_degree': self.active_sh_degree,
+            'ss': self.ss,
             'scene_center': self.scene_center.data.contiguous(),
             'inside_extent': self.inside_extent.data.contiguous(),
             'scene_extent': self.scene_extent.data.contiguous(),
@@ -29,6 +31,8 @@ class SVInOut:
             '_geo_grid_pts': self._geo_grid_pts.data.contiguous(),
             '_sh0': self._sh0.data.contiguous(),
             '_shs': self._shs.data.contiguous(),
+            '_log_s': self._log_s.data.contiguous(),
+            'is_leaf': self.is_leaf.data.contiguous(),
         }
 
         if quantize:
@@ -47,13 +51,13 @@ class SVInOut:
         '''
         Load the saved models.
         '''
-        self.loaded_path = path
         state_dict = torch.load(path, map_location="cpu", weights_only=False)
 
         if state_dict.get('quantized', False):
             dequantize_state_dict(state_dict)
 
         self.active_sh_degree = state_dict['active_sh_degree']
+        self.ss = state_dict['ss']
 
         self.scene_center = state_dict['scene_center'].cuda()
         self.inside_extent = state_dict['inside_extent'].cuda()
@@ -61,30 +65,40 @@ class SVInOut:
 
         self.octpath = state_dict['octpath'].cuda()
         self.octlevel = state_dict['octlevel'].cuda().to(torch.int8)
+        self.vox_center, self.vox_size = octree_utils.octpath_decoding(
+            self.octpath, self.octlevel, self.scene_center, self.scene_extent)
+        self.grid_pts_key, self.vox_key = octree_utils.build_grid_pts_link(self.octpath, self.octlevel)
 
         self._geo_grid_pts = state_dict['_geo_grid_pts'].cuda().requires_grad_()
         self._sh0 = state_dict['_sh0'].cuda().requires_grad_()
         self._shs = state_dict['_shs'].cuda().requires_grad_()
+        self._log_s = state_dict['_log_s'].cuda().requires_grad_()
+        self.is_leaf = state_dict['is_leaf'].cuda()
 
-        # Subdivision priority trackor
-        self._subdiv_p = torch.ones(
-            [self.num_voxels, 1],
-            dtype=torch.float32, device="cuda").requires_grad_()
+        N = len(self.octpath)
+        self._subdiv_p = torch.full([N, 1], 1.0, dtype=torch.float32, device="cuda").requires_grad_()
+        self.subdiv_meta = torch.zeros([N, 1], dtype=torch.float32, device="cuda")
 
-    def save_iteration(self, model_path, iteration, quantize=False):
-        path = os.path.join(model_path, "checkpoints", f"iter{iteration:06d}_model.pt")
+        self.bg_color = torch.tensor(
+            [1, 1, 1] if self.white_background else [0, 0, 0],
+            dtype=torch.float32, device="cuda")
+
+        self.loaded_path = path
+
+    def save_iteration(self, iteration, quantize=False):
+        path = os.path.join(self.model_path, "checkpoints", f"iter{iteration:06d}_model.pt")
         self.save(path, quantize=quantize)
         self.latest_save_iter = iteration
 
-    def load_iteration(self, model_path, iteration=-1):
+    def load_iteration(self, iteration=-1):
         if iteration == -1:
             # Find the maximum iteration if it is -1.
-            fnames = os.listdir(os.path.join(model_path, "checkpoints"))
+            fnames = os.listdir(os.path.join(self.model_path, "checkpoints"))
             loaded_iter = max(int(re.sub("[^0-9]", "", fname)) for fname in fnames)
         else:
             loaded_iter = iteration
 
-        path = os.path.join(model_path, "checkpoints", f"iter{loaded_iter:06d}_model.pt")
+        path = os.path.join(self.model_path, "checkpoints", f"iter{loaded_iter:06d}_model.pt")
         self.load(path)
 
         self.loaded_iter = iteration

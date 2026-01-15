@@ -241,11 +241,11 @@ def gen_octpath_dense(outside_level, n_level_inside):
     if n_level_inside > 1:
         dense_octpath = torch.arange((2**(n_level_inside-1)) ** 3, dtype=torch.int64, device="cuda")
         dense_octpath = dense_octpath << (3 * (MAX_NUM_LEVELS-(outside_level+1)-(n_level_inside-1)))
-        octpath = (octpath.view(8,1) | dense_octpath)
+        octpath = (octpath.view(8,1) | dense_octpath) #[8, 1]  |  [64^3]  →  [8, 64^3]
 
     octpath = octpath.reshape(-1, 1)
     octlevel = torch.full_like(octpath, outside_level + n_level_inside, dtype=torch.int8)
-    return octpath, octlevel
+    return octpath, octlevel #5/14일 이해완
 
 
 def gen_octpath_shell(shell_level, n_level_inside):
@@ -289,3 +289,27 @@ def clamp_level(octpath, octlevel, max_lv):
     octlevel = octlevel.to(torch.int8)
 
     return octpath, octlevel
+
+def update_valid_gradient_table(cfg_mode, vox_center, vox_size, scene_center, inside_extent, grid_res, is_leaf):
+    if(cfg_mode == "exp_linear_11"):
+        dummy_mask = torch.tensor([], dtype=torch.bool, device="cuda")
+        dummy_keys = torch.tensor([], dtype=torch.int32, device="cuda")
+        dummy_vox = torch.tensor([], dtype=torch.int32, device="cuda")
+        return dummy_mask, dummy_keys, dummy_vox
+    
+    
+    grid_mask, grid_keys, grid2voxel = svraster_cuda.utils.valid_gradient_table(vox_center, vox_size, scene_center, inside_extent, grid_res,is_leaf)
+    
+    # Sort by grid_keys (flat index)
+    sorted_vals, sorted_idx = grid_keys.sort()
+
+    # Apply sorting
+    grid_keys = sorted_vals
+    grid2voxel = grid2voxel[sorted_idx]
+    print(f"Total valid grid points: {len(grid_keys)}")
+    print(f"Total valid voxels: {len(grid2voxel)}")
+    #print("First 1000 grid_keys:\n", grid_keys[:1000].tolist())
+    #print("First 1000 grid2voxel:\n", grid2voxel[:1000].tolist())
+    #print("First 1000 grid_mask:\n", grid_mask[:1000].tolist())
+
+    return grid_mask, grid_keys, grid2voxel

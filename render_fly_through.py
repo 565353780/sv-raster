@@ -1,3 +1,14 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -50,41 +61,46 @@ if __name__ == "__main__":
     update_config(os.path.join(args.model_path, 'config.yaml'))
 
     # Load data
-    data_pack = DataPack(
-        source_path=cfg.data.source_path,
-        image_dir_name=cfg.data.image_dir_name,
-        res_downscale=cfg.data.res_downscale,
-        res_width=cfg.data.res_width,
-        skip_blend_alpha=cfg.data.skip_blend_alpha,
-        alpha_is_white=cfg.model.white_background,
-        data_device=cfg.data.data_device,
-        use_test=cfg.data.eval,
-        test_every=cfg.data.test_every,
-        camera_params_only=True,
-    )
+    data_pack = DataPack(cfg.data, cfg.model.white_background, camera_params_only=True)
 
-    # Interpolate cameras
-    interp_cams = data_pack.interpolate_cameras(
-        n_frames=args.n_frames,
-        starting_id=args.starting_id,
-        ids=args.ids,
-        step_forward=args.step_forward,
-    )
+    # Interpolate poses
+    cams = data_pack.get_train_cameras()
+    if len(args.ids):
+        key_poses = [cams[i].c2w.cpu().numpy() for i in args.ids]
+    else:
+        cam_pos = torch.stack([cam.position for cam in cams])
+        ids = [args.starting_id]
+        for _ in range(3):
+            farthest_id = torch.cdist(cam_pos[ids], cam_pos).amin(0).argmax().item()
+            ids.append(farthest_id)
+        ids[1], ids[2] = ids[2], ids[1]
+        key_poses = [cams[i].c2w.cpu().numpy() for i in ids]
+
+    if args.step_forward != 0:
+        for i in range(len(key_poses)):
+            lookat = key_poses[i][:3, 2]
+            key_poses[i][:3, 3] += args.step_forward * lookat
+
+    interp_poses = interpolate_poses(key_poses, n_frame=args.n_frames, periodic=True)
 
     # Load model
-    voxel_model = SparseVoxelModel(
-        n_samp_per_vox=cfg.model.n_samp_per_vox,
-        sh_degree=cfg.model.sh_degree,
-        ss=cfg.model.ss,
-        white_background=cfg.model.white_background,
-        black_background=cfg.model.black_background,
-    )
-    loaded_iter = voxel_model.load_iteration(args.model_path, args.iteration)
+    voxel_model = SparseVoxelModel(cfg.model)
+    loaded_iter = voxel_model.load_iteration(args.iteration)
     voxel_model.freeze_vox_geo()
 
     # Rendering
+    fovx = cams[0].fovx
+    fovy = cams[0].fovy
+    width = cams[0].image_width
+    height = cams[0].image_height
+
     video = []
-    for cam in tqdm(interp_cams, desc="Rendering progress"):
+    for pose in tqdm(interp_poses, desc="Rendering progress"):
+
+        cam = MiniCam(
+            c2w=pose,
+            fovx=fovx, fovy=fovy,
+            width=width, height=height)
 
         with torch.no_grad():
             render_pkg = voxel_model.render(cam)
@@ -99,6 +115,6 @@ if __name__ == "__main__":
 
         video.append(im_tensor2np(rendering))
 
-    outpath = os.path.join(args.model_path, "render_fly_through.mp4")
+    outpath = os.path.join(voxel_model.model_path, "render_fly_through.mp4")
     imageio.mimwrite(outpath, video, fps=30)
     print("Save to", outpath)

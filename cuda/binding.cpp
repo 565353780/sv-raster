@@ -15,7 +15,11 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 #include "src/forward.h"
 #include "src/backward.h"
 #include "src/sh_compute.h"
+#include "src/vg_compute.h"
 #include "src/tv_compute.h"
+#include "src/ge_compute.h"
+#include "src/ls_compute.h"
+#include "src/pl_compute.h"
 #include "src/geo_params_gather.h"
 #include "src/utils.h"
 #include "src/adam_step.h"
@@ -37,6 +41,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sh_compute_bw", &SH_COMPUTE::sh_compute_bw);
 
     m.def("total_variation_bw", &TV_COMPUTE::total_variation_bw);
+    m.def("voxel_gradient_bw", &VG_COMPUTE::voxel_gradient_bw);
+    m.def("grid_eikonal_bw", &GE_COMPUTE::grid_eikonal_bw);
+    m.def("laplacian_smoothness_bw", &LS_COMPUTE::laplacian_smoothness_bw);
+    m.def("points_loss_bw", &PL_COMPUTE::points_loss_bw);
 
     m.def("is_in_cone", &UTILS::is_in_cone);
     m.def("compute_rd", &UTILS::compute_rd);
@@ -44,6 +52,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("voxel_order_rank", &UTILS::voxel_order_rank);
     m.def("ijk_2_octpath", &UTILS::ijk_2_octpath);
     m.def("octpath_2_ijk", &UTILS::octpath_2_ijk);
+    m.def("valid_gradient_table", &UTILS::valid_gradient_table);
 
     m.def("unbiased_adam_step", &ADAM_STEP::unbiased_adam_step);
     m.def("biased_adam_step", &ADAM_STEP::biased_adam_step);
@@ -51,5 +60,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // Some readonly constant
     m.attr("MAX_NUM_LEVELS") = pybind11::int_(MAX_NUM_LEVELS);
     m.attr("STEP_SZ_SCALE") = pybind11::float_(STEP_SZ_SCALE);
-    m.attr("MAX_N_SAMP") = pybind11::int_(MAX_N_SAMP);
+
+    m.attr("VOX_TRIINTERP_MODE") = pybind11::int_(VOX_TRIINTERP_MODE);
+    m.attr("VOX_TRIINTERP1_MODE") = pybind11::int_(VOX_TRIINTERP1_MODE);
+    m.attr("VOX_TRIINTERP3_MODE") = pybind11::int_(VOX_TRIINTERP3_MODE);
+
+    m.attr("EXP_LINEAR_11_MODE") = pybind11::int_(EXP_LINEAR_11_MODE);
+    m.attr("SDF_MODE") = pybind11::int_(SDF_MODE);
+
+    m.attr("CAM_PERSP") = pybind11::int_(CAM_PERSP);
+    m.attr("CAM_ORTHO") = pybind11::int_(CAM_ORTHO);
 }

@@ -1,3 +1,14 @@
+/*
+ * Copyright (C) 2023, Inria
+ * GRAPHDECO research group, https://team.inria.fr/graphdeco
+ * All rights reserved.
+ *
+ * This software is free for non-commercial, research and evaluation use 
+ * under the terms of the LICENSE.md file.
+ *
+ * For inquiries contact  george.drettakis@inria.fr
+ */
+
 /*************************************************************************
 Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
@@ -21,6 +32,7 @@ namespace cg = cooperative_groups;
 namespace PREPROCESS {
 
 // CUDA implementation of the preprocess step.
+template <int cam_mode>
 __global__ void preprocessCUDA(
     const int P,
     const int W, const int H,
@@ -33,7 +45,7 @@ __global__ void preprocessCUDA(
 
     const float3* __restrict__ vox_centers,
     const float* __restrict__ vox_lengths,
-
+    const uint8_t* __restrict__ is_leaf,
     int* __restrict__ out_n_duplicates,
     uint32_t* __restrict__ n_duplicates,
     uint2* __restrict__ bboxes,
@@ -50,7 +62,8 @@ __global__ void preprocessCUDA(
     // We later can then skip rendering voxel with 0 duplication.
     out_n_duplicates[idx] = 0;
     n_duplicates[idx] = 0;
-
+    if(is_leaf[idx] == 0)
+        return; // Not a leaf node.
     // Load from global memory.
     const float3 vox_c = vox_centers[idx];
     const float vox_r = 0.5f * vox_lengths[idx];
@@ -84,9 +97,18 @@ __global__ void preprocessCUDA(
 
         float2 corner_coord;
         int quadrant_id;
-        const float inv_z = 1.0f / cam_corner.z;
-        corner_coord = make_float2(cam_corner.x * inv_z, cam_corner.y * inv_z);
-        quadrant_id = compute_corner_quadrant_id(world_corner, ro);
+        if (cam_mode == CAM_ORTHO)
+        {
+            const float3 lookat = third_col_3x4(c2w_matrix);
+            corner_coord = make_float2(cam_corner.x, cam_corner.y);
+            quadrant_id = compute_ray_quadrant_id(lookat);
+        }
+        else
+        {
+            const float inv_z = 1.0f / cam_corner.z;
+            corner_coord = make_float2(cam_corner.x * inv_z, cam_corner.y * inv_z);
+            quadrant_id = compute_corner_quadrant_id(world_corner, ro);
+        }
 
         coord_min = min(coord_min, corner_coord);
         coord_max = max(coord_max, corner_coord);
@@ -140,11 +162,13 @@ rasterize_preprocess(
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
+    const int cam_mode,
     const float near,
 
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
     const torch::Tensor& vox_lengths,
+    const torch::Tensor& is_leaf,
 
     const bool debug)
 {
@@ -174,7 +198,12 @@ rasterize_preprocess(
     const float focal_y = 0.5f * image_height / tan_fovy;
 
     // Lanching CUDA
-    preprocessCUDA <<<(P + 255) / 256, 256>>> (
+    const auto kernel_func =
+        (cam_mode == CAM_ORTHO) ?
+            preprocessCUDA<CAM_ORTHO> :
+            preprocessCUDA<CAM_PERSP> ;
+
+    kernel_func <<<(P + 255) / 256, 256>>> (
         P,
         image_width, image_height,
         tan_fovx, tan_fovy,
@@ -186,7 +215,7 @@ rasterize_preprocess(
 
         (float3*)(vox_centers.contiguous().data_ptr<float>()),
         vox_lengths.contiguous().data_ptr<float>(),
-
+        is_leaf.contiguous().data_ptr<uint8_t>(),
         out_n_duplicates.contiguous().data_ptr<int>(),
         geomState.n_duplicates,
         geomState.bboxes,

@@ -23,11 +23,13 @@ rasterize_preprocess(
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
+    const int cam_mode,
     const float near,
 
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
     const torch::Tensor& vox_lengths,
+    const torch::Tensor& is_leaf,
 
     const bool debug);
 

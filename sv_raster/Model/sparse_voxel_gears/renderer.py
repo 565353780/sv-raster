@@ -19,7 +19,9 @@ class SVRenderer:
         '''
         with torch.no_grad():
             self.frozen_vox_geo = svraster_cuda.renderer.GatherGeoParams.apply(
+                self.vox_geo_mode,
                 self.vox_key,
+                self.vox_size_inv,
                 torch.arange(self.num_voxels, device="cuda"),
                 self._geo_grid_pts
             )
@@ -45,19 +47,17 @@ class SVRenderer:
             @vox_params A dictionary of the pre-process voxel properties.
         '''
 
-        # Gather the density values at the eight corners of each voxel.
-        # It defined a trilinear density field.
-        # The final tensor are in shape [#vox, 8]
         if hasattr(self, 'frozen_vox_geo'):
             geos = self.frozen_vox_geo
         else:
             geos = svraster_cuda.renderer.GatherGeoParams.apply(
+                self.vox_geo_mode,
                 self.vox_key,
+                self.vox_size_inv,
                 idx,
                 self._geo_grid_pts
             )
 
-        # Compute voxel colors
         if color_mode is None or color_mode == "sh":
             active_sh_degree = self.active_sh_degree
             color_mode = "sh"
@@ -66,7 +66,7 @@ class SVRenderer:
             color_mode = "sh"
 
         if color_mode == "sh":
-            rgbs = svraster_cuda.renderer.SH_eval.apply(
+            rgbs = svraster_cuda.renderer.SH_eval.apply( #view dependent color
                 active_sh_degree,
                 idx,
                 self.vox_center,
@@ -77,27 +77,29 @@ class SVRenderer:
             )
         elif color_mode == "rand":
             rgbs = torch.rand([self.num_voxels, 3], dtype=torch.float32, device="cuda")
+        elif color_mode == "level":
+            import matplotlib.pyplot as plt
+            n_lv = float(self.octlevel.max() - self.octlevel.min())
+            lv = (self.octlevel - self.octlevel.min()).div(n_lv).clamp_max(1).flatten().cpu().numpy()
+            rgbs = torch.tensor(plt.get_cmap('brg')(lv)[:, :3], dtype=torch.float32, device="cuda")
         elif color_mode == "dontcare":
             rgbs = torch.empty([self.num_voxels, 3], dtype=torch.float32, device="cuda")
         else:
             raise NotImplementedError
 
-        # Pack everything
         vox_params = {
-            'geos': geos,
-            'rgbs': rgbs,
-            'subdiv_p': self._subdiv_p, # Dummy param to record subdivision priority
+            'geos': geos, #8 corners of each voxel [N,8,3]
+            'rgbs': rgbs, # RGB color of each voxel [N,3]
+            'subdiv_p': self._subdiv_p,  # Dummy param to record gradients [N, 1]
+            'log_s': self._log_s, #숫자 하나
         }
-        if vox_params['subdiv_p'] is None:
-            vox_params['subdiv_p'] = torch.ones([self.num_voxels, 1], device="cuda")
-
         return vox_params
 
     def render(
             self,
             camera,
             color_mode=None,
-            track_max_w=False,
+            track_max_w=False, # Track max weight for each voxel
             ss=None,
             output_depth=False,
             output_normal=False,
@@ -117,14 +119,13 @@ class SVRenderer:
         if ss != 1.0 and 'gt_color' in other_opt:
             other_opt['gt_color'] = resize_rendering(other_opt['gt_color'], size=(h, w))
 
-        n_samp_per_vox = other_opt.pop('n_samp_per_vox', self.n_samp_per_vox)
-
         ###################################
         # Call low-level rasterization API
         ###################################
         raster_settings = svraster_cuda.renderer.RasterSettings(
             color_mode=color_mode,
-            n_samp_per_vox=n_samp_per_vox,
+            vox_geo_mode=self.vox_geo_mode,
+            density_mode=self.density_mode,
             image_width=w,
             image_height=h,
             tanfovx=camera.tanfovx,
@@ -133,18 +134,24 @@ class SVRenderer:
             cy=camera.cy * h_ss,
             w2c_matrix=camera.w2c,
             c2w_matrix=camera.c2w,
-            bg_color=float(self.white_background),
+            background=self.bg_color,
+            cam_mode=camera.cam_mode,
             near=camera.near,
             need_depth=output_depth,
             need_normal=output_normal,
             track_max_w=track_max_w,
             **other_opt)
-        color, depth, normal, T, max_w = svraster_cuda.renderer.rasterize_voxels(
+        leaf_mask = self.is_leaf
+        if leaf_mask.ndim == 2 and leaf_mask.shape[1] == 1:
+            leaf_mask = leaf_mask.squeeze(1)
+        leaf_mask = leaf_mask.to(torch.uint8).contiguous().to(self.octpath.device)
+        color, depth, normal, T, max_w, feat = svraster_cuda.renderer.rasterize_voxels(
             raster_settings,
             self.octpath,
             self.vox_center,
             self.vox_size,
-            self.vox_fn)
+            self.vox_fn,
+            leaf_mask,)
 
         ###################################
         # Post-processing and pack output
@@ -163,9 +170,10 @@ class SVRenderer:
             'normal': normal if output_normal else None,
             'T': T if output_T else None,
             'max_w': max_w,
+            'feat': feat if feat.numel() > 0 else None,
         }
 
-        for k in ['color', 'depth', 'normal', 'T']:
+        for k in ['color', 'depth', 'normal', 'T', 'feat']:
             render_pkg[f'raw_{k}'] = render_pkg[k]
 
             # Post process super-sampling

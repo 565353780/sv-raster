@@ -7,21 +7,23 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
+import math
 import time
 import numpy as np
 from tqdm import tqdm
 import trimesh
 
 import torch
+import svraster_cuda
 
-from src.config import cfg, update_config
+from src.config import cfg, update_argparser, update_config
 from src.utils import octree_utils
 from src.utils import activation_utils
-from src.utils.marching_cubes_utils import torch_marching_cubes_grid
+from src.sparse_voxel_gears.adaptive import subdivide_by_interp, agg_voxel_into_grid_pts
 
 from src.dataloader.data_pack import DataPack
 from src.sparse_voxel_model import SparseVoxelModel
-
+ 
 from src.utils.fuser_utils import Fuser
 
 
@@ -58,7 +60,7 @@ def tsdf_fusion(
 
 def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, crop_bbox):
 
-    # Render depth and alpha for all training views
+    # Render depth and alphas
     cam_lst = data_pack.get_train_cameras()
     depth_lst = []
     alpha_lst = []
@@ -83,55 +85,67 @@ def extract_mesh_progressive(args, data_pack, voxel_model, init_lv, final_lv, cr
         inside_min = torch.tensor(crop_bbox[0], dtype=torch.float32, device="cuda")
         inside_max = torch.tensor(crop_bbox[1], dtype=torch.float32, device="cuda")
 
-    # Initialize a dense grid
-    vol = SparseVoxelModel(sh_degree=0)
-    vol.model_init(
-        bounding=torch.stack([inside_min, inside_max]),
-        outside_level=0,
-        init_n_level=init_lv,
-    )
+    # Construct a initial dense grid
+    octpath, octlevel = octree_utils.gen_octpath_dense(
+        outside_level=voxel_model.outside_level,
+        n_level_inside=init_lv)
+    grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+    grid_pts_xyz = octree_utils.compute_gridpoints_xyz(grid_pts_key, voxel_model.scene_center, voxel_model.scene_extent)
+
+    # Filter outside
+    grid_inside_mask = ((inside_min <= grid_pts_xyz) & (grid_pts_xyz <= inside_max)).all(-1)
+    vox_inside_mask = grid_inside_mask[vox_key].any(-1)
+    vox_inside_idx = torch.where(vox_inside_mask)[0]
+    octpath = octpath[vox_inside_idx]
+    octlevel = octlevel[vox_inside_idx]
+    grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+    grid_pts_xyz = octree_utils.compute_gridpoints_xyz(grid_pts_key, voxel_model.scene_center, voxel_model.scene_extent)
 
     # Run progressive TSDF fusion
+    print(f'TSDF levels from {init_lv} to {final_lv}')
     for lv in range(init_lv, final_lv+1):
 
-        # Determine bandwidth
-        now_voxel_size = vol.vox_size[0].item()
-        bandwidth = args.bandwidth_vox * now_voxel_size
-        print(f"Running lv={lv:2d}: #voxels={vol.num_voxels:9d}; vox_size={now_voxel_size}; band={bandwidth}")
+        # Determine trunction
+        now_level = torch.tensor([voxel_model.outside_level + min(lv, args.trunc_lv)], device="cuda")
+        now_voxel_size = octree_utils.level_2_vox_size(voxel_model.scene_extent, now_level).item()
+        trunc_dist = args.trunc_vox * now_voxel_size
+
+        print(f"Running lv={lv:2d}: #voxels={len(octpath)}; vox_size={now_voxel_size}; trunc={trunc_dist}")
 
         # Run tsdf fusion at current levels
         grid_tsdf = tsdf_fusion(
             cam_lst, depth_lst, alpha_lst,
-            vol.grid_pts_xyz, bandwidth, args.crop_border, args.alpha_thres)
+            grid_pts_xyz, trunc_dist, args.crop_border, args.alpha_thres)
 
-        # Progressive to next level
+        # Merge from previous levels
         if lv < final_lv:
+            # Remove some voxels
+            vox_tsdf = grid_tsdf[vox_key]
+            prune_mask = vox_tsdf.isnan().any(-1) | (vox_tsdf.amax(1) < -args.pg_prune) | (vox_tsdf.amin(1) > args.pg_prune)
+            filter_idx = torch.where(~prune_mask)[0]
+            octpath = octpath[filter_idx]
+            octlevel = octlevel[filter_idx]
 
-            # Prune voxels
-            vox_tsdf = grid_tsdf[vol.vox_key]  # Get the sd values of voxel corners [#vox, 8]
-            thickness = 2 / args.bandwidth_vox  # Keep voxels touching a surface thickness of 2 voxels
-            thickness = min(thickness, 0.99)
-            prune_mask = vox_tsdf.isnan().any(-1) | \
-                        (vox_tsdf.amax(1) < -thickness) | \
-                        (vox_tsdf.amin(1) > thickness)
-            vol.pruning(prune_mask)
+            # Subdivide voxels
+            octpath, octlevel = octree_utils.gen_children(octpath, octlevel)
+            grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+            grid_pts_xyz = octree_utils.compute_gridpoints_xyz(grid_pts_key, voxel_model.scene_center, voxel_model.scene_extent)
 
-            # Subdivide to next level
-            vol.subdividing(torch.ones([vol.num_voxels], dtype=torch.bool))
+            del grid_tsdf, vox_tsdf
+            torch.cuda.empty_cache()
 
-    # Extract mesh from grid
-    verts, faces = torch_marching_cubes_grid(
+    verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
         grid_pts_val=grid_tsdf,
-        grid_pts_xyz=vol.grid_pts_xyz,
-        vox_key=vol.vox_key,
+        grid_pts_xyz=grid_pts_xyz,
+        vox_key=vox_key,
         iso=0)
     mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
     return mesh
 
 
-def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, iso=0):
+def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, use_lv_avg, iso=0):
 
-    # Render depth and alpha for all training views
+    # Render depth and alphas
     cam_lst = data_pack.get_train_cameras()
     depth_lst = []
     alpha_lst = []
@@ -155,40 +169,72 @@ def extract_mesh(args, data_pack, voxel_model, final_lv, crop_bbox, iso=0):
     else:
         inside_min = torch.tensor(crop_bbox[0], dtype=torch.float32, device="cuda")
         inside_max = torch.tensor(crop_bbox[1], dtype=torch.float32, device="cuda")
+    inside_mask = ((inside_min <= voxel_model.grid_pts_xyz) & (voxel_model.grid_pts_xyz <= inside_max)).all(-1)
+    inside_mask = inside_mask[voxel_model.vox_key].any(-1)
+    inside_idx = torch.where(inside_mask)[0]
+
+    octpath = voxel_model.octpath[inside_idx]
+    octlevel = voxel_model.octlevel[inside_idx]
 
     # Clamp levels
-    target_lv = voxel_model.outside_level + final_lv
-    octpath, octlevel = octree_utils.clamp_level(voxel_model.octpath, voxel_model.octlevel, target_lv)
+    target_level = voxel_model.outside_level + final_lv
+    octpath, octlevel = octree_utils.clamp_level(octpath, octlevel, target_level)
+    print(f'Voxel levels from {octlevel.min()} to {octlevel.max()}')
 
-    # Initialize from clamped adaptive sparse voxels
-    vol = SparseVoxelModel(sh_degree=0)
-    vol.octpath_init(
-        voxel_model.scene_center,
-        voxel_model.scene_extent,
-        octpath,
-        octlevel,
-    )
+    # Construct grid points
+    grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+    grid_pts_xyz = octree_utils.compute_gridpoints_xyz(grid_pts_key, voxel_model.scene_center, voxel_model.scene_extent)
 
-    # Prune voxel outside
-    gridpts_outside = ((vol.grid_pts_xyz < inside_min) | (vol.grid_pts_xyz > inside_max)).any(-1)
-    corners_outside = gridpts_outside[vol.vox_key]
-    prune_mask = corners_outside.all(-1)
-    vol.pruning(prune_mask)
-
-    # Determine bandwidth
-    bandwidth = args.bandwidth_vox * vol.vox_size.min().item()
-
-    # Run TSDF fusion
-    print(f"Running adaptive: #voxels={vol.num_voxels:9d} / band={bandwidth}")
+    # Run tsdf fusion
+    vox_level = torch.tensor([voxel_model.outside_level + args.trunc_lv], device="cuda")
+    vox_size = octree_utils.level_2_vox_size(voxel_model.scene_extent, vox_level).item()
+    trunc_dist = args.trunc_vox * vox_size
+    print(f"Running adaptive: #voxels={len(octpath)} / finest vox_size={voxel_model.vox_size.min().item()} / trunc={trunc_dist}")
     grid_tsdf = tsdf_fusion(
         cam_lst, depth_lst, alpha_lst,
-        vol.grid_pts_xyz, bandwidth, args.crop_border, args.alpha_thres)
+        grid_pts_xyz, trunc_dist, args.crop_border, args.alpha_thres)
 
-    # Extract mesh from grid
-    verts, faces = torch_marching_cubes_grid(
+    if use_lv_avg:
+        while True:
+            n_ori = len(octlevel)
+            unit_val = grid_tsdf[vox_key]
+
+            # Filter
+            mask = (unit_val > iso).any(1) & (unit_val < iso).any(1) & ~unit_val.isnan().any(1)
+            filter_idx = torch.where(mask)[0]
+            octpath = octpath[filter_idx]
+            octlevel = octlevel[filter_idx]
+            unit_val = unit_val[filter_idx]
+
+            # Compute children
+            mask = (octlevel.squeeze() < target_level)
+            kept_idx = torch.where(~mask)[0]
+            subdiv_idx = torch.where(mask)[0]
+            if len(subdiv_idx) == 0:
+                break
+            child_octpath, child_octlevel = octree_utils.gen_children(octpath[subdiv_idx], octlevel[subdiv_idx])
+            child_unit_val = subdivide_by_interp(unit_val[subdiv_idx])
+
+            # Compute new voxels and tsdf grid points
+            octpath = torch.cat([octpath[kept_idx], child_octpath])
+            octlevel = torch.cat([octlevel[kept_idx], child_octlevel])
+            unit_val = torch.cat([unit_val[kept_idx], child_unit_val])
+            grid_pts_key, vox_key = octree_utils.build_grid_pts_link(octpath, octlevel)
+            grid_pts_xyz = octree_utils.compute_gridpoints_xyz(grid_pts_key, voxel_model.scene_center, voxel_model.scene_extent)
+            grid_tsdf = agg_voxel_into_grid_pts(len(grid_pts_xyz), vox_key, unit_val)
+
+            n_new = len(octlevel)
+            print(f"Subdiv {n_ori:10d} => {n_new:10d}")
+
+        del unit_val, grid_pts_key, filter_idx, kept_idx, subdiv_idx
+
+    del octpath, octlevel
+    torch.cuda.empty_cache()
+
+    verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
         grid_pts_val=grid_tsdf,
-        grid_pts_xyz=vol.grid_pts_xyz,
-        vox_key=vol.vox_key,
+        grid_pts_xyz=grid_pts_xyz,
+        vox_key=vox_key,
         iso=iso)
     mesh = trimesh.Trimesh(verts.cpu().numpy(), faces.cpu().numpy())
     return mesh
@@ -214,7 +260,7 @@ def direct_mc(args, voxel_model, final_lv, crop_bbox):
     iso = getattr(activation_utils, f"{voxel_model.density_mode}_inverse")(iso_density)
     sign = -1
 
-    verts, faces = torch_marching_cubes_grid(
+    verts, faces = svraster_cuda.marching_cubes.torch_marching_cubes_grid(
         grid_pts_val=sign * voxel_model._geo_grid_pts,
         grid_pts_xyz=voxel_model.grid_pts_xyz,
         vox_key=voxel_model.vox_key[inside_idx],
@@ -293,37 +339,30 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--save_gpu", action='store_true')
     parser.add_argument("--overwrite_ss", default=None, type=float)
-    parser.add_argument("--overwrite_n_samp_per_vox", default=None, type=str)
-
-    # Output file name
-    parser.add_argument("--mesh_fname", default=None, type=str)
-
-    # Provide bounding box to extract mesh
+    parser.add_argument("--overwrite_vox_geo_mode", default=None, type=str)
     parser.add_argument("--bbox_path", default=None)
     parser.add_argument("--bbox_scale", default=1.0, type=float)
-    
-    # Algorithm
+    parser.add_argument("--mesh_fname", default=None, type=str)
+
     parser.add_argument("--direct", action='store_true')
-    parser.add_argument("--progressive", action='store_true')
-
-    # Level to run MC
-    parser.add_argument("--init_lv", default=8, type=int)
+    parser.add_argument("--adaptive", action='store_true')
+    parser.add_argument("--init_lv", default=7, type=int)
     parser.add_argument("--final_lv", default=10, type=int)
-
-    # Truncation bandwidth in the unit of voxel size
-    parser.add_argument("--bandwidth_vox", default=5.0, type=float)
-
-    # TSDF fusion hyperparams
+    parser.add_argument("--trunc_lv", default=10, type=int)
+    parser.add_argument("--trunc_vox", default=5.0, type=float)
     parser.add_argument("--crop_border", default=0.01, type=float)
     parser.add_argument("--alpha_thres", default=0.5, type=float)
-
-    # Other hyperparams
+    parser.add_argument("--pg_prune", default=0.6, type=float)
     parser.add_argument("--use_mean", action='store_true')
     parser.add_argument("--use_vert_color", action='store_true')
     parser.add_argument("--use_clean", action='store_true')
+    parser.add_argument("--use_lv_avg", action='store_true')
     parser.add_argument("--use_remesh", action='store_true')
     parser.add_argument("--remesh_len", default=-1, type=float)
 
+    parser.add_argument("--voxel_size", default=0.004, type=float)
+    parser.add_argument("--sdf_trunc", default=0.016, type=float)
+    parser.add_argument("--depth_trunc", default=3.0, type=float)
     args = parser.parse_args()
     print("Rendering " + args.model_path)
 
@@ -331,34 +370,17 @@ if __name__ == "__main__":
     update_config(os.path.join(args.model_path, 'config.yaml'))
 
     # Load data
-    data_pack = DataPack(
-        source_path=cfg.data.source_path,
-        image_dir_name=cfg.data.image_dir_name,
-        res_downscale=cfg.data.res_downscale,
-        res_width=cfg.data.res_width,
-        skip_blend_alpha=cfg.data.skip_blend_alpha,
-        alpha_is_white=cfg.model.white_background,
-        data_device=cfg.data.data_device,
-        use_test=cfg.data.eval,
-        test_every=cfg.data.test_every,
-        camera_params_only=True,
-    )
+    data_pack = DataPack(cfg.data, cfg.model.white_background)
 
     # Load model
-    voxel_model = SparseVoxelModel(
-        n_samp_per_vox=cfg.model.n_samp_per_vox,
-        sh_degree=cfg.model.sh_degree,
-        ss=cfg.model.ss,
-        white_background=cfg.model.white_background,
-        black_background=cfg.model.black_background,
-    )
-    voxel_model.load_iteration(args.model_path, args.iteration)
+    voxel_model = SparseVoxelModel(cfg.model)
+    voxel_model.load_iteration(args.iteration)
     voxel_model.freeze_vox_geo()
 
     if args.overwrite_ss is not None:
         voxel_model.ss = args.overwrite_ss
-    if args.overwrite_n_samp_per_vox is not None:
-        voxel_model.n_samp_per_vox = args.overwrite_n_samp_per_vox
+    if args.overwrite_vox_geo_mode is not None:
+        voxel_model.vox_geo_mode = args.overwrite_vox_geo_mode
 
     # Prepare output dir
     outdir = os.path.join(
@@ -368,20 +390,8 @@ if __name__ == "__main__":
 
     print(f'outdir: {outdir}')
     print(f'ss            =: {voxel_model.ss}')
-    print(f'n_samp_per_vox=: {voxel_model.n_samp_per_vox}')
-    print(f'Voxel level distribution:')
-    for lv, num in enumerate(voxel_model.octlevel.flatten().bincount().tolist()):
-        if num > 0:
-            size = octree_utils.level_2_vox_size(voxel_model.scene_extent, torch.tensor(lv)).item()
-            percen = num / voxel_model.num_voxels * 100
-            suffix = ""
-            if lv == voxel_model.outside_level + args.final_lv:
-                suffix = ">>> MC level <<<"
-            elif lv == voxel_model.outside_level + args.init_lv and args.progressive:
-                suffix = ">>> Init level <<<"
-            elif lv > voxel_model.outside_level + args.final_lv and not args.progressive:
-                suffix = ">>> Level clamped <<<"
-            print(f'  level={lv:2d} (size={size:.6f}): {num:7d} ({percen:5.2f}%) {suffix}')
+    print(f'vox_geo_mode  =: {voxel_model.vox_geo_mode}')
+    print(f'density_mode  =: {voxel_model.density_mode}')
 
     # Read crop bbox
     if args.bbox_path:
@@ -393,12 +403,17 @@ if __name__ == "__main__":
     fname = 'mesh'
     eps_time = time.time()
     with torch.no_grad():
-        if args.progressive:
+        if args.direct:
+            mesh = direct_mc(args, voxel_model, args.final_lv, crop_bbox)
+            fname += f'_direct'
+        elif args.adaptive:
+            mesh = extract_mesh(args, data_pack, voxel_model, args.final_lv, crop_bbox, args.use_lv_avg)
+            fname += f'_lv{args.final_lv}_adaptive'
+            if args.use_lv_avg:
+                fname += '_lv_avg'
+        else:
             fname += f'_lv{args.init_lv}-{args.final_lv}'
             mesh = extract_mesh_progressive(args, data_pack, voxel_model, args.init_lv, args.final_lv, crop_bbox)
-        else:
-            mesh = extract_mesh(args, data_pack, voxel_model, args.final_lv, crop_bbox)
-            fname += f'_lv{args.final_lv}_adaptive'
     eps_time = time.time() - eps_time
     print(f"Extracted mesh in {eps_time:.3f} sec")
 

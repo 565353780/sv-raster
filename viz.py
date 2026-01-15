@@ -36,30 +36,13 @@ class SVRasterViewer:
     def __init__(self, cfg):
 
         # Load cameras
-        data_pack = DataPack(
-            source_path=cfg.data.source_path,
-            image_dir_name=cfg.data.image_dir_name,
-            res_downscale=cfg.data.res_downscale,
-            res_width=cfg.data.res_width,
-            skip_blend_alpha=cfg.data.skip_blend_alpha,
-            alpha_is_white=cfg.model.white_background,
-            data_device=cfg.data.data_device,
-            use_test=cfg.data.eval,
-            test_every=cfg.data.test_every,
-            camera_params_only=True,
-        )
+        data_pack = DataPack(cfg.data, camera_params_only=True)
         self.tr_cam_lst = data_pack.get_train_cameras()
         self.te_cam_lst = data_pack.get_test_cameras()
 
         # Load model
-        self.voxel_model = SparseVoxelModel(
-            n_samp_per_vox=cfg.model.n_samp_per_vox,
-            sh_degree=cfg.model.sh_degree,
-            ss=cfg.model.ss,
-            white_background=cfg.model.white_background,
-            black_background=cfg.model.black_background,
-        )
-        self.voxel_model.load_iteration(args.model_path, args.iteration)
+        self.voxel_model = SparseVoxelModel(cfg.model)
+        self.voxel_model.load_iteration(args.iteration)
         self.voxel_model.freeze_vox_geo()
 
         # Create viser server

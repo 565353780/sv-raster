@@ -1,3 +1,14 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 #
 # NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -115,16 +126,23 @@ class CameraBase:
 
         return normal_pseudo
 
+    def composite_bg_color(self, bg_color):
+        if self.mask is None:
+            return
+        bg_color = bg_color.view(3, 1, 1).to(self.image.device)
+        self.image = self.image * self.mask + (1 - self.mask) * bg_color
+
 
 class Camera(CameraBase):
     def __init__(
             self, image_name,
             w2c, fovx, fovy, cx_p, cy_p,
             near=0.02,
-            image=None, mask=None, depth=None,
+            image=None, mask=None, depth=None, normal=None, conf=None,
             sparse_pt=None):
 
         self.image_name = image_name
+        self.cam_mode = 'persp'
 
         # Camera parameters
         self.w2c = torch.tensor(w2c, dtype=torch.float32, device="cuda")
@@ -146,7 +164,8 @@ class Camera(CameraBase):
         # Load mask and depth if there are
         self.mask = mask.cpu() if mask is not None else None
         self.depth = depth.cpu() if depth is not None else None
-
+        self.normal = normal.cpu() if normal is not None else None
+        self.conf = conf.cpu() if conf is not None else None
         # Load sparse depth
         if sparse_pt is not None:
             self.sparse_pt = torch.tensor(sparse_pt, dtype=torch.float32, device="cpu")
@@ -159,6 +178,10 @@ class Camera(CameraBase):
             self.mask = self.mask.to(device)
         if self.depth is not None:
             self.depth = self.depth.to(device)
+        if self.normal is not None:
+            self.normal = self.normal.to(device)
+        if self.conf is not None:
+            self.conf = self.conf.to(device)
         return self
 
     def auto_exposure_init(self):
@@ -192,16 +215,15 @@ class Camera(CameraBase):
             near=self.near,
             cx_p=self.cx_p, cy_p=self.cy_p)
 
-
 class MiniCam(CameraBase):
     def __init__(self,
             c2w, fovx, fovy,
             width, height,
             near=0.02,
-            cx_p=None, cy_p=None,
-            image_name="minicam"):
+            cx_p=None, cy_p=None):
 
-        self.image_name = image_name
+        self.image_name = 'minicam'
+        self.cam_mode = 'persp'
         self.c2w = torch.tensor(c2w).clone().cuda()
         self.w2c = self.c2w.inverse()
 
@@ -285,3 +307,36 @@ class MiniCam(CameraBase):
             [0, 0, 1],
         ], dtype=torch.float32, device="cuda")
         return self.rotate(R)
+
+
+class OrthoCam(MiniCam):
+    def __init__(self,
+            c2w,
+            x_len, y_len,
+            width, height,
+            near=0.02):
+
+        self.image_name = 'orthocam'
+        self.cam_mode = 'ortho'
+
+        self.c2w = torch.tensor(c2w).clone()
+        self.w2c = self.c2w.inverse()
+
+        self.c2w = self.c2w.cuda()
+        self.w2c = self.w2c.cuda()
+
+        self.image_width = width
+        self.image_height = height
+
+        self.tanfovx = x_len * 0.5
+        self.tanfovy = y_len * 0.5
+        self.cx_p = 0.5
+        self.cy_p = 0.5
+        self.near = near
+
+    def __repr__(self):
+        clsname = self.__class__.__name__
+        fname = f"image_name='{self.image_name}'"
+        res = f"HW=({self.image_height}x{self.image_width})"
+        fov = f"len={self.tanfovy*2:.1f}x{self.tanfovx*2}"
+        return f"{clsname}({fname}, {res}, {fov})"

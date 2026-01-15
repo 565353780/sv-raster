@@ -8,13 +8,15 @@
 
 import torch
 from . import _C
-
+from .meta import VoxGeoModes, DensityModes, CamModes
+from .render_neus import render_neus
 from typing import NamedTuple
 
 
 class RasterSettings(NamedTuple):
     color_mode: str
-    n_samp_per_vox: int
+    vox_geo_mode: str
+    density_mode: str
     image_width: int
     image_height: int
     tanfovx: float
@@ -23,7 +25,8 @@ class RasterSettings(NamedTuple):
     cy: float
     w2c_matrix: torch.Tensor
     c2w_matrix: torch.Tensor
-    bg_color: float = 0
+    background: torch.Tensor
+    cam_mode: str = "persp"
     near: float = 0.02
     need_depth: bool = False
     need_normal: bool = False
@@ -33,6 +36,8 @@ class RasterSettings(NamedTuple):
     lambda_dist: float = 0
     # Optional gt color for color concnetration loss in backward pass.
     gt_color: torch.Tensor = torch.empty(0)
+    # Optional voxel feature to render. Slower if there is.
+    vox_feats: torch.Tensor = torch.empty([0, 0])
     debug: bool = False
 
 
@@ -42,25 +47,35 @@ def rasterize_voxels(
         vox_centers: torch.Tensor,
         vox_lengths: torch.Tensor,
         vox_fn,
+        is_leaf: torch.Tensor,
     ):
 
     # Some input checking
     if not isinstance(raster_settings, RasterSettings):
         raise Exception("Expect RasterSettings as first argument.")
-    if raster_settings.n_samp_per_vox > _C.MAX_N_SAMP or raster_settings.n_samp_per_vox < 1:
-        raise Exception(f"n_samp_per_vox should be in range [1, {_C.MAX_N_SAMP}].")
+    if raster_settings.vox_geo_mode not in VoxGeoModes:
+        raise NotImplementedError("Unknown voxel geo mode.")
+    if raster_settings.density_mode not in DensityModes:
+        print(raster_settings.density_mode, flush=True)
+        raise NotImplementedError("Unknown density mode.")
+    if raster_settings.cam_mode not in CamModes:
+        raise NotImplementedError("Unknow camera mode.")
 
     N = octree_paths.numel()
     device = octree_paths.device
+    
     if vox_centers.shape[0] != N or vox_lengths.numel() != N:
         raise Exception("Size mismatched.")
     if len(vox_centers.shape) != 2 or vox_centers.shape[1] != 3:
         raise Exception("Expect vox_centers in shape [N, 3].")
     if raster_settings.w2c_matrix.device != device or \
             raster_settings.c2w_matrix.device != device or \
+            raster_settings.background.device != device or \
             vox_centers.device != device or \
             vox_lengths.device != device:
         raise Exception("Device mismatch.")
+    if raster_settings.vox_feats.requires_grad:
+        raise NotImplementedError
 
     # Preprocess octree
     n_duplicates, geomBuffer = _C.rasterize_preprocess(
@@ -72,23 +87,30 @@ def rasterize_voxels(
         raster_settings.cy,
         raster_settings.w2c_matrix,
         raster_settings.c2w_matrix,
+        CamModes[raster_settings.cam_mode],
         raster_settings.near,
 
         octree_paths,
         vox_centers,
         vox_lengths,
+        is_leaf,
 
         raster_settings.debug,
     )
-    in_frusts_idx = torch.where(n_duplicates > 0)[0]
+    #n_duplicates: [N], number of duplicates for each voxel
+    #geomBuffer: voxel?�� 카메?�� ?��?��?��????�� ?��?�� ?��분면?�� ?��?��?���?, 복�???�� screen-space bounding box ?���? ?��
+    in_frusts_idx = torch.where(n_duplicates > 0)[0] 
 
     # Forward voxel parameters
     cam_pos = raster_settings.c2w_matrix[:3, 3]
     vox_params = vox_fn(in_frusts_idx, cam_pos, raster_settings.color_mode)
+    #?��?�� 카메?�� 뷰에 ????��, �? ?��?��?��?�� voxel?��?�� geometry(geos)??? ?��?��(rgbs)?�� 계산?��?�� ?��?��?���? ?��?���? ?��겨주?�� ?��?��
     geos = vox_params['geos']
     rgbs = vox_params['rgbs']
     subdiv_p = vox_params['subdiv_p']
-
+    log_s = vox_params['log_s']
+    #log_s_clamped = torch.clamp(log_s, min=0.3)
+    s_val = torch.exp(log_s * 10.0)
     # Some voxel parameters checking
     if geos.shape != (N, 8):
         raise Exception(f"Expect geos in ({N}, 8) but got", geos.shape)
@@ -114,6 +136,7 @@ def rasterize_voxels(
         if raster_settings.gt_color.device != device:
             raise Exception("Device mismatch.")
 
+
     # Involk differentiable voxels rasterization.
     return _RasterizeVoxels.apply(
         raster_settings,
@@ -123,7 +146,9 @@ def rasterize_voxels(
         vox_lengths,
         geos,
         rgbs,
+        raster_settings.vox_feats,
         subdiv_p,
+        s_val,
     )
 
 
@@ -138,13 +163,16 @@ class _RasterizeVoxels(torch.autograd.Function):
         vox_lengths,
         geos,
         rgbs,
+        vox_feats,
         subdiv_p,
+        s_val,
     ):
 
         need_distortion = raster_settings.lambda_dist > 0
 
         args = (
-            raster_settings.n_samp_per_vox,
+            VoxGeoModes[raster_settings.vox_geo_mode],
+            DensityModes[raster_settings.density_mode],
             raster_settings.image_width,
             raster_settings.image_height,
             raster_settings.tanfovx,
@@ -153,7 +181,8 @@ class _RasterizeVoxels(torch.autograd.Function):
             raster_settings.cy,
             raster_settings.w2c_matrix,
             raster_settings.c2w_matrix,
-            raster_settings.bg_color,
+            raster_settings.background,
+            CamModes[raster_settings.cam_mode],
             raster_settings.need_depth,
             need_distortion,
             raster_settings.need_normal,
@@ -164,13 +193,24 @@ class _RasterizeVoxels(torch.autograd.Function):
             vox_lengths,
             geos,
             rgbs,
+            vox_feats,
 
             geomBuffer,
 
             raster_settings.debug,
+
+            s_val,
         )
 
-        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w = _C.rasterize_voxels(*args)
+        num_rendered, binningBuffer, imgBuffer, out_color, out_depth, out_normal, out_T, max_w, out_sdf0, out_feat = _C.rasterize_voxels(*args)
+
+        # In case you want some advanced debuging here
+        # ranges, tile_last, n_contrib = _C.unpack_ImageState(raster_settings.image_width, raster_settings.image_height, imgBuffer)
+        # ranges_x = ranges[:, :, 0]
+        # ranges_y = ranges[:, :, 1]
+        # tile_nonempty = (ranges_y - ranges_x > 0)
+        # print(ranges_y[tile_nonempty] - tile_last[tile_nonempty])
+        # import pdb; pdb.set_trace()
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
@@ -178,22 +218,26 @@ class _RasterizeVoxels(torch.autograd.Function):
         ctx.save_for_backward(
             octree_paths, vox_centers, vox_lengths,
             geos, rgbs,
-            geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal)
+            geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal, s_val, out_sdf0,)
         ctx.mark_non_differentiable(max_w)
-        return out_color, out_depth, out_normal, out_T, max_w
+        return out_color, out_depth, out_normal, out_T, max_w, out_feat
 
     @staticmethod
-    def backward(ctx, dL_dout_color, dL_dout_depth, dL_dout_normal, dL_dout_T, dL_dmax_w):
+    def backward(ctx, dL_dout_color, dL_dout_depth, dL_dout_normal, dL_dout_T, dL_dmax_w, dL_dout_feat):
         # Restore necessary values from context
         raster_settings = ctx.raster_settings
         num_rendered = ctx.num_rendered
         octree_paths, vox_centers, vox_lengths, \
             geos, rgbs, \
-            geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal = ctx.saved_tensors
+            geomBuffer, binningBuffer, imgBuffer, out_T, out_depth, out_normal, s_val, out_sdf0 = ctx.saved_tensors
+
+        if raster_settings.cam_mode == "ortho":
+            raise NotImplementedError("Backward pass of orthographic projection is not implemented.")
 
         args = (
             num_rendered,
-            raster_settings.n_samp_per_vox,
+            VoxGeoModes[raster_settings.vox_geo_mode],
+            DensityModes[raster_settings.density_mode],
             raster_settings.image_width,
             raster_settings.image_height,
             raster_settings.tanfovx,
@@ -202,7 +246,8 @@ class _RasterizeVoxels(torch.autograd.Function):
             raster_settings.cy,
             raster_settings.w2c_matrix,
             raster_settings.c2w_matrix,
-            raster_settings.bg_color,
+            # CamModes[raster_settings.cam_mode],
+            raster_settings.background,
 
             octree_paths,
             vox_centers,
@@ -230,9 +275,13 @@ class _RasterizeVoxels(torch.autograd.Function):
             out_normal,
 
             raster_settings.debug,
+
+            s_val,
+            out_sdf0,
         )
 
-        dL_dgeos, dL_drgbs, subdiv_p_bw = _C.rasterize_voxels_backward(*args)
+        dL_dgeos, dL_drgbs, subdiv_p_bw, dL_ds_val = _C.rasterize_voxels_backward(*args)
+        dL_drgbs = dL_drgbs.view(rgbs.shape).contiguous()
 
         grads = (
             None, # => raster_settings
@@ -242,7 +291,9 @@ class _RasterizeVoxels(torch.autograd.Function):
             None, # => vox_lengths
             dL_dgeos, # => geos
             dL_drgbs, # => rgbs
+            None, # => vox_feats
             subdiv_p_bw, # => subdivision priority
+            dL_ds_val.view_as(s_val), # ?��?��?��?��
         )
 
         return grads
@@ -320,7 +371,9 @@ class GatherGeoParams(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
+        vox_geo_mode,
         vox_key,
+        vox_size_inv,
         care_idx,
         grid_pts,
     ):
@@ -328,21 +381,29 @@ class GatherGeoParams(torch.autograd.Function):
         assert len(care_idx.shape) == 1
         assert grid_pts.shape[0] == grid_pts.numel()
 
-        geo_params = _C.gather_triinterp_geo_params(vox_key, care_idx, grid_pts)
+        if vox_geo_mode.startswith("triinterp"):
+            geo_params = _C.gather_triinterp_geo_params(vox_key, care_idx, grid_pts)
+        else:
+            raise NotImplementedError(f"Unknow vox_geo_mode: {vox_geo_mode}")
 
+        ctx.vox_geo_mode = vox_geo_mode
         ctx.num_grid_pts = grid_pts.numel()
-        ctx.save_for_backward(vox_key, care_idx)
+        ctx.save_for_backward(vox_key, vox_size_inv, care_idx)
         return geo_params
 
     @staticmethod
     def backward(ctx, dL_dgeo_params):
         # Restore necessary values from context
+        vox_geo_mode = ctx.vox_geo_mode
         num_grid_pts = ctx.num_grid_pts
-        vox_key, care_idx = ctx.saved_tensors
+        vox_key, vox_size_inv, care_idx = ctx.saved_tensors
 
-        dL_dgrid_pts = _C.gather_triinterp_geo_params_bw(vox_key, care_idx, num_grid_pts, dL_dgeo_params)
+        if vox_geo_mode.startswith("triinterp"):
+            dL_dgrid_pts = _C.gather_triinterp_geo_params_bw(vox_key, care_idx, num_grid_pts, dL_dgeo_params)
+        else:
+            raise NotImplementedError(f"Unknow vox_geo_mode: {vox_geo_mode}")
 
-        return None, None, dL_dgrid_pts
+        return None, None, None, None, dL_dgrid_pts
 
 
 class GatherFeatParams(torch.autograd.Function):
@@ -380,9 +441,14 @@ def mark_n_duplicates(
         cx, cy,
         w2c_matrix, c2w_matrix, near,
         octree_paths, vox_centers, vox_lengths,
+        cam_mode="persp",
         return_buffer=False,
-        debug=False):
-
+        debug=False,
+        is_leaf: torch.Tensor = None):
+    device = octree_paths.device
+    N = octree_paths.numel()
+    if is_leaf is None:
+        is_leaf = torch.ones(N, dtype=torch.uint8, device=device)
     n_duplicates, geomBuffer = _C.rasterize_preprocess(
         image_width,
         image_height,
@@ -392,17 +458,39 @@ def mark_n_duplicates(
         cy,
         w2c_matrix,
         c2w_matrix,
+        CamModes[cam_mode],
         near,
 
         octree_paths,
         vox_centers,
         vox_lengths,
+        is_leaf,
 
         debug,
     )
     if return_buffer:
         return n_duplicates, geomBuffer
     return n_duplicates
+
+
+def mark_min_samp_rate(cameras, octree_paths, vox_centers, vox_lengths, near=0.02):
+    MAX_RATE = 1e30
+    min_samp_rate = torch.full([len(octree_paths)], MAX_RATE, dtype=torch.float32, device="cuda")
+    for cam in cameras:
+        n_duplicates = mark_n_duplicates(
+            image_width=cam.image_width, image_height=cam.image_height,
+            tanfovx=cam.tanfovx, tanfovy=cam.tanfovy,
+            cx=cam.cx, cy=cam.cy,
+            w2c_matrix=cam.w2c, c2w_matrix=cam.c2w, near=near,
+            octree_paths=octree_paths, vox_centers=vox_centers, vox_lengths=vox_lengths)
+        zdist = ((vox_centers - cam.position) * cam.lookat).sum(-1)
+        vis_idx = torch.where((n_duplicates > 0) & (zdist > near))[0]
+        zdist = zdist[vis_idx]
+        samp_interval = zdist * cam.pix_size
+        samp_rate = vox_lengths.squeeze(1)[vis_idx] / samp_interval
+        min_samp_rate[vis_idx] = torch.minimum(min_samp_rate[vis_idx], samp_rate)
+    min_samp_rate[min_samp_rate >= MAX_RATE] = 0
+    return min_samp_rate
 
 
 def mark_max_samp_rate(cameras, octree_paths, vox_centers, vox_lengths, near=0.02):
@@ -421,6 +509,27 @@ def mark_max_samp_rate(cameras, octree_paths, vox_centers, vox_lengths, near=0.0
         samp_rate = vox_lengths.squeeze(1)[vis_idx] / samp_interval
         max_samp_rate[vis_idx] = torch.maximum(max_samp_rate[vis_idx], samp_rate)
     return max_samp_rate
+
+
+def mark_avg_samp_rate(cameras, octree_paths, vox_centers, vox_lengths, near=0.02):
+    total_samp_rate = torch.zeros([len(octree_paths)], dtype=torch.float32, device="cuda")
+    total_cnt = torch.zeros([len(octree_paths)], dtype=torch.float32, device="cuda")
+    for cam in cameras:
+        n_duplicates = mark_n_duplicates(
+            image_width=cam.image_width, image_height=cam.image_height,
+            tanfovx=cam.tanfovx, tanfovy=cam.tanfovy,
+            cx=cam.cx, cy=cam.cy,
+            w2c_matrix=cam.w2c, c2w_matrix=cam.c2w, near=near,
+            octree_paths=octree_paths, vox_centers=vox_centers, vox_lengths=vox_lengths)
+        zdist = ((vox_centers - cam.position) * cam.lookat).sum(-1)
+        vis_idx = torch.where((n_duplicates > 0) & (zdist > near))[0]
+        zdist = zdist[vis_idx]
+        samp_interval = zdist * cam.pix_size
+        samp_rate = vox_lengths.squeeze(1)[vis_idx] / samp_interval
+        total_samp_rate[vis_idx] += samp_rate
+        total_cnt[vis_idx] += 1
+    avg_samp_rate = total_samp_rate / total_cnt.clamp_min(1)
+    return avg_samp_rate
 
 
 def mark_near(cameras, octree_paths, vox_centers, vox_lengths, near=0.2):

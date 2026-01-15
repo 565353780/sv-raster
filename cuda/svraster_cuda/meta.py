@@ -12,3 +12,20 @@ from . import _C
 
 MAX_NUM_LEVELS = _C.MAX_NUM_LEVELS
 STEP_SZ_SCALE = _C.STEP_SZ_SCALE
+
+
+VoxGeoModes = dict(
+    triinterp=_C.VOX_TRIINTERP_MODE,
+    triinterp1=_C.VOX_TRIINTERP1_MODE,
+    triinterp3=_C.VOX_TRIINTERP3_MODE,
+)
+
+DensityModes = dict(
+    exp_linear_11=_C.EXP_LINEAR_11_MODE,
+    sdf=_C.SDF_MODE,
+)
+
+CamModes = dict(
+    persp=_C.CAM_PERSP,
+    ortho=_C.CAM_ORTHO,
+)

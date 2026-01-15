@@ -28,12 +28,15 @@ license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
-
+enum DensityMode {
+    DENSITY_EXP_LINEAR_11 = 0,
+    DENSITY_SDF = 1
+};
 namespace BACKWARD {
 
 // CUDA backward pass of sparse voxel rendering.
 template <bool need_depth, bool need_distortion, bool need_normal,
-          int n_samp>
+          int n_samp, int density_mode>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
     const uint2* __restrict__ ranges,
@@ -42,7 +45,7 @@ renderCUDA(
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* __restrict__ c2w_matrix,
-    const float bg_color,
+    const float3* __restrict__ background,
 
     const uint2* __restrict__ bboxes,
     const float3* __restrict__ vox_centers,
@@ -65,8 +68,10 @@ renderCUDA(
     const float lambda_dist,
     const float* out_D,
     const float* out_N,
-
-    float* dL_dvox)
+    const float* __restrict__ s_val,
+    const float* __restrict__ sdf0_buffer,
+    float* dL_dvox,
+    float* dL_ds_val)
 {
     // We rasterize again. Compute necessary block info.
     auto block = cg::this_thread_block();
@@ -111,7 +116,6 @@ renderCUDA(
     const float3 rd = rd_raw * rd_norm_inv;
     const float3 rd_inv = {1.f/ rd.x, 1.f / rd.y, 1.f / rd.z};
     uint32_t pix_quad_id = compute_ray_quadrant_id(rd);
-
     // Check if this thread is associated with a valid pixel or outside.
     bool inside = (pix.x < W) && (pix.y < H);
     // Done threads can help with fetching, but don't rasterize
@@ -170,7 +174,8 @@ renderCUDA(
         dL_dpix.y = dL_dout_color[1 * H * W + pix_id];
         dL_dpix.z = dL_dout_color[2 * H * W + pix_id];
         const float dL_dpix_T = dL_dout_T[pix_id];
-        last_dL_dT = dL_dpix_T + bg_color * (dL_dpix.x + dL_dpix.y + dL_dpix.z);
+        const float3 bg_color = background[0];
+        last_dL_dT = dL_dpix_T + dot(bg_color, dL_dpix);
 
         dL_dD = dL_dout_depth[pix_id] * rd_norm_inv;
         dL_dN.x = dL_dout_normal[0 * H * W + pix_id];
@@ -282,53 +287,231 @@ renderCUDA(
 
             // Compute closed-form volume integral.
             float geo_params[8];
+            #pragma unroll
             for (int k=0; k<8; ++k)
                 geo_params[k] = collected_geo_params[j*8 + k];
             float dL_dgeo_params[8] = {0.f};
-
-            float vol_int = 0.f;
+            float alpha = 0.f;
+            float d_alpha_d_entry = 0.f;
+            float d_alpha_d_exit  = 0.f;
+            float sdf_entry = 0.f, sdf_exit = 0.f;
+            float interp_w_entry[8], interp_w_exit[8];
+            float phi_entry = 0.f, phi_exit = 0.f, denom = 1.f;
+            float exp_neg_vol_int = 0.f;
             float dI_dgeo_params[8] = {0.f};
             float each_dI_dgeo_params[n_samp][8];
             float interp_w[8];
             float local_alphas[n_samp];
-
+            const int vox_id = collected_vox_id[j];
             float vox_l_inv = 1.f / vox_l;
-            const float step_sz = (b - a) * (1.f / n_samp);
-            const float3 step = step_sz * rd;
-            float3 pt = ro + (a + 0.5f * step_sz) * rd;
-            float3 qt = (pt - (vox_c - 0.5f * vox_l)) * vox_l_inv;
-            const float3 qt_step = step * vox_l_inv;
-
             #pragma unroll
-            for (int k=0; k<n_samp; k++, qt=qt+qt_step)
-            {
-                tri_interp_weight(qt, interp_w);
-                float d = 0.f;
-                for (int iii=0; iii<8; ++iii)
-                    d += geo_params[iii] * interp_w[iii];
-                const float local_vol_int = STEP_SZ_SCALE * step_sz * exp_linear_11(d);
-                vol_int += local_vol_int;
-
-                if (need_depth && n_samp > 1)
-                    local_alphas[k] = min(MAX_ALPHA, 1.f - expf(-local_vol_int));
-
-                const float dd_dd = STEP_SZ_SCALE * step_sz * exp_linear_11_bw(d);
-                for (int iii=0; iii<8; ++iii)
-                {
-                    float tmp = dd_dd * interp_w[iii];
-                    dI_dgeo_params[iii] += tmp;
-                    if (need_depth && n_samp > 1)
-                        each_dI_dgeo_params[k][iii] = tmp;
-                }
+            for (int kk=0; kk<n_samp; ++kk){
+                #pragma unroll
+                for (int ii=0; ii<8; ++ii) each_dI_dgeo_params[kk][ii] = 0.f;
+                local_alphas[kk] = 0.f;
             }
+            if(density_mode == DENSITY_SDF)
+            {
+                float3 p_entry = ro + a * rd;
+                float3 p_exit  = ro + b * rd;
 
-            // Compute alpha from volume integral.
-            // Follow 3DGS's alpha clamping to avoid numerical instabilities.
-            const float exp_neg_vol_int = expf(-vol_int);
-            float alpha = min(MAX_ALPHA, 1.f - exp_neg_vol_int);
-            if (alpha < MIN_ALPHA)
+
+                float3 qt_entry = (p_entry - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                float3 qt_exit  = (p_exit  - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+
+                tri_interp_weight(qt_entry, interp_w_entry);
+                tri_interp_weight(qt_exit,  interp_w_exit);
+
+                for (int i = 0; i < 8; ++i) {
+                    sdf_entry += geo_params[i] * interp_w_entry[i];
+                    sdf_exit  += geo_params[i] * interp_w_exit[i];
+                }
+
+                phi_entry = 1.f / (1.f + expf(-s_val[0] * sdf_entry));
+                phi_exit  = 1.f / (1.f + expf(-s_val[0] * sdf_exit));
+                float eps = 1e-6f;
+                denom = phi_entry + eps;
+                float raw_alpha = (phi_entry - phi_exit) / denom;
+                alpha = fmaxf(raw_alpha, 0.f);
+                exp_neg_vol_int = 1.f; //����?
+
+                if (need_depth && (n_samp == 2 || n_samp == 3)) {
+                    const float3 qt0 = ( (ro + a * rd) - (vox_c - 0.5f * vox_l) ) * vox_l_inv;
+                    const float3 qt_step = ((b - a) * rd / n_samp) * vox_l_inv;
+
+                    float eps = 1e-6f;
+                    // kk 구간의 양 끝점
+                    #pragma unroll
+                    for (int kk = 0; kk < n_samp; ++kk) {
+                        float3 qk  = qt0 + qt_step * kk;
+                        float3 qk1 = qt0 + qt_step * (kk + 1);
+
+                        float wk[8], wk1[8];
+                        tri_interp_weight(qk,  wk);
+                        tri_interp_weight(qk1, wk1);
+
+                        // sdf, phi at two endpoints
+                        float sdf_k = 0.f, sdf_k1 = 0.f;
+                        #pragma unroll
+                        for (int ii=0; ii<8; ++ii) {
+                            sdf_k  += geo_params[ii] * wk[ii];
+                            sdf_k1 += geo_params[ii] * wk1[ii];
+                        }
+                        float phi_k  = 1.f / (1.f + expf(-s_val[0] * sdf_k));
+                        float phi_k1 = 1.f / (1.f + expf(-s_val[0] * sdf_k1));
+
+                        // forward의 local_alphas와 동일(Neus-style 구간 alpha)
+                        float denom_k = phi_k + eps;
+                        float raw_alpha_k = (phi_k - phi_k1) / denom_k;
+                        float alpha_k = fmaxf(raw_alpha_k, 0.f);                // clamp 하되
+                        float allow   = raw_alpha_k > 0.f ? 1.f : 0.f;
+
+                        if (need_depth && n_samp > 1) {
+                            local_alphas[kk] = alpha_k; // forward와 동일한 값 저장
+                        }
+
+                        // d alpha_k / d phi_k, d phi_k1 (체인룰)
+                        float d_ad_phi_k  = allow * ((phi_k1) / (denom_k * denom_k));
+                        float d_ad_phi_k1 = allow * (-1.f / denom_k);
+
+                        // d phi / d sdf
+                        float dphi_k_dsdf  = s_val[0] * phi_k  * (1.f - phi_k );
+                        float dphi_k1_dsdf = s_val[0] * phi_k1 * (1.f - phi_k1);
+
+                        // d alpha_k / d g_i = d_ad_phi_k * dphi_k/dsdf * w_k[i] + d_ad_phi_k1 * dphi_k1/dsdf * w_k1[i]
+                        #pragma unroll
+                        for (int ii=0; ii<8; ++ii) {
+                            each_dI_dgeo_params[kk][ii] += d_ad_phi_k  * dphi_k_dsdf  * wk[ii]
+                                                    + d_ad_phi_k1 * dphi_k1_dsdf * wk1[ii];
+                        }
+                    }
+                }
+                
+            }
+            else{
+                float vol_int = 0.f;
+                
+                const float step_sz = (b - a) * (1.f / n_samp);
+                const float3 step = step_sz * rd;
+                float3 pt = ro + (a + 0.5f * step_sz) * rd;
+                float3 qt = (pt - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                const float3 qt_step = step * vox_l_inv;
+
+                #pragma unroll
+                for (int k=0; k<n_samp; k++, qt=qt+qt_step)
+                {
+                    tri_interp_weight(qt, interp_w);
+                    float d = 0.f;
+                    for (int iii=0; iii<8; ++iii)
+                        d += geo_params[iii] * interp_w[iii];
+                    const float local_vol_int = STEP_SZ_SCALE * step_sz * exp_linear_11(d);
+                    vol_int += local_vol_int;
+
+                    if (need_depth && n_samp > 1)
+                        local_alphas[k] = min(MAX_ALPHA, 1.f - expf(-local_vol_int));
+
+                    const float dd_dd = STEP_SZ_SCALE * step_sz * exp_linear_11_bw(d);
+                    for (int iii=0; iii<8; ++iii)
+                    {
+                        float tmp = dd_dd * interp_w[iii];
+                        dI_dgeo_params[iii] += tmp;
+                        if (need_depth && n_samp > 1)
+                            each_dI_dgeo_params[k][iii] = tmp;
+                    }
+                }
+
+                // Compute alpha from volume integral.
+                // Follow 3DGS's alpha clamping to avoid numerical instabilities.
+                exp_neg_vol_int = expf(-vol_int);
+                alpha = min(MAX_ALPHA, 1.f - exp_neg_vol_int);
+            }
+            if (alpha < MIN_ALPHA){
+                if (lambda_ascending > 0)
+                { 
+                    /*
+                    const float3 pt_a = ro + a * rd;
+                    const float3 qt_a = (pt_a - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                    const float3 pt_b = ro + b * rd;
+                    const float3 qt_b = (pt_b - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+
+                    float interp_w_a[8], interp_w_b[8];
+                    tri_interp_weight(qt_a, interp_w_a);
+                    tri_interp_weight(qt_b, interp_w_b);
+
+                    float d_a = 0.f, d_b = 0.f;
+                    for (int iii=0; iii<8; ++iii)
+                    {
+                        d_a += geo_params[iii] * interp_w_a[iii];
+                        d_b += geo_params[iii] * interp_w_b[iii];
+                    }
+
+                    if (density_mode == DENSITY_SDF) {
+                         // L = max(0, d_b - d_a)
+                        const float reg_w = weight_ascending * static_cast<float>(d_b > d_a);
+
+                        float grad_pack_local[12] = {0.f};
+                        if (T<0.5) continue;
+                        for (int iii = 0; iii < 8; ++iii) {
+                            grad_pack_local[iii] = reg_w * T * (interp_w_b[iii] - interp_w_a[iii]);
+                        }
+
+                        const int base_id = cg::this_grid().thread_rank();
+                        #pragma unroll
+                        for (int iii = 0; iii < 12; ++iii) {
+                            atomicAdd(dL_dvox + vox_id * 12 + (base_id + iii) % 12,
+                                    grad_pack_local[(base_id + iii) % 12]);
+                        }
+                    }*/
+                    const float3 pt_a = ro + a * rd;
+                    const float3 qt_a = (pt_a - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                    const float3 pt_b = ro + b * rd;
+                    const float3 qt_b = (pt_b - (vox_c - 0.5f * vox_l)) * vox_l_inv;
+                        
+                    float interp_w_a[8], interp_w_b[8];
+                    tri_interp_weight(qt_a, interp_w_a);
+                    tri_interp_weight(qt_b, interp_w_b);
+                    
+
+                    float d_a = 0.f, d_b = 0.f;
+                    for (int iii=0; iii<8; ++iii)
+                    {
+                        d_a += geo_params[iii] * interp_w_a[iii];
+                        d_b += geo_params[iii] * interp_w_b[iii];
+                    }
+                    /*
+                    if (density_mode == DENSITY_SDF) {
+                        // descending: L = max(0, d_b - d_a)
+                        const float reg_w = weight_ascending * static_cast<float>(d_b > d_a);
+                        for (int iii = 0; iii < 8; ++iii)
+                            dL_dgeo_params[iii] += reg_w * (interp_w_b[iii] - interp_w_a[iii]);
+                    } else {
+                        // original ascending: L = max(0, d_a - d_b)
+                        const float reg_w = weight_ascending * pt_w * static_cast<float>(d_a > d_b);
+                        for (int iii = 0; iii < 8; ++iii)
+                            dL_dgeo_params[iii] += reg_w * (interp_w_a[iii] - interp_w_b[iii]);
+                    }*/
+                    float s = (b - a);          // rd가 unit이 아니면 length(rd) 필요
+                    s = fmaxf(s, 1e-6f);                     // 분모 안정화
+                    const float inv_s = 1.f / s;
+
+                    const float delta = d_b - d_a;           // (이미 위에서 계산되어 있어야 함)
+
+                    // 게이팅/가중(그대로)
+                    //if (T < 0.5f) continue;
+                    const float pt_w = alpha * T / (1.f - alpha);
+                    const float reg_w = weight_ascending *pt_w;
+
+                    // dL/d(delta) = 2 * (delta/s + 2) * (1/s)
+                    const float g = 2.f * reg_w * ((delta * inv_s) + 2.f) * inv_s;
+
+                    // 코너별 기여(그대로)
+                    #pragma unroll
+                    for (int iii = 0; iii < 8; ++iii) {
+                        dL_dgeo_params[iii] += g * (interp_w_b[iii] - interp_w_a[iii]);
+                    }
+                }
                 continue;
-
+            }
             // Recover the blending weight of this voxel.
             T = T / (1.f - alpha);
             const float pt_w = alpha * T;
@@ -336,7 +519,7 @@ renderCUDA(
             // Propagate gradients to per-voxel colors and keep
             // gradients w.r.t. voxel alpha.
             // Load from share memory.
-            const int vox_id = collected_vox_id[j];
+            //const int vox_id = collected_vox_id[j];
 
             const float3 c = collected_rgb[j];
 
@@ -361,9 +544,64 @@ renderCUDA(
                 suffix_wm += now_wm;
                 suffix_w += pt_w;
             }
+            const float sdf0_t = sdf0_buffer[pix_id];
+            if(false){// (need_normal && density_mode == DENSITY_SDF && sdf0_t > 0.f) {
+                float3 p_sdf0 = ro + sdf0_t * rd;
 
+                float3 min_corner = vox_c - 0.5f * vox_l;
+                float3 max_corner = vox_c + 0.5f * vox_l;
+
+                bool sdf_in_voxel = 
+                    (p_sdf0.x >= min_corner.x && p_sdf0.x <= max_corner.x) &&
+                    (p_sdf0.y >= min_corner.y && p_sdf0.y <= max_corner.y) &&
+                    (p_sdf0.z >= min_corner.z && p_sdf0.z <= max_corner.z);
+
+                if (sdf_in_voxel) {
+                    float vox_l_inv = 1.f / vox_l;
+                    float3 qt_sdf0 = (p_sdf0 - (vox_c - 0.5f * vox_l)) * vox_l_inv;  // [0,1]^3
+                    float x = qt_sdf0.x, y = qt_sdf0.y, z = qt_sdf0.z;
+                    const float* g = geo_params;
+
+                    float grad_x =
+                        (1 - y)*(1 - z)*(g[1] - g[0]) +
+                        (    y)*(1 - z)*(g[3] - g[2]) +
+                        (1 - y)*(    z)*(g[5] - g[4]) +
+                        (    y)*(    z)*(g[7] - g[6]);
+
+                    float grad_y =
+                        (1 - x)*(1 - z)*(g[2] - g[0]) +
+                        (    x)*(1 - z)*(g[3] - g[1]) +
+                        (1 - x)*(    z)*(g[6] - g[4]) +
+                        (    x)*(    z)*(g[7] - g[5]);
+
+                    float grad_z =
+                        (1 - x)*(1 - y)*(g[4] - g[0]) +
+                        (    x)*(1 - y)*(g[5] - g[1]) +
+                        (1 - x)*(    y)*(g[6] - g[2]) +
+                        (    x)*(    y)*(g[7] - g[3]);
+
+                    float3 grad = make_float3(grad_x, grad_y, grad_z);
+                    float norm = safe_rnorm(grad);
+                    float3 N = grad * norm;  // forward�� normal
+                    float3 dL_dN_sdf = T * dL_dN;  // pt_w�� T * alpha, �̰� normal loss�� �ش�
+
+                    // Chain rule: dL/dg = dL/dN ? dN/dg = (I - NN?) * dL/dN * dgrad/dg
+                    float3 dL_dgrad = dL_dN_sdf - dot(dL_dN_sdf, N) * N;  // projection
+                    float dnx = dL_dgrad.x * norm;
+                    float dny = dL_dgrad.y * norm;
+                    float dnz = dL_dgrad.z * norm;
+                    dL_dgeo_params[0] += -dnx * (1 - y)*(1 - z) - dny * (1 - x)*(1 - z) - dnz * (1 - x)*(1 - y);
+                    dL_dgeo_params[1] +=  dnx * (1 - y)*(1 - z) - dny *     x *(1 - z) - dnz *     x *(1 - y);
+                    dL_dgeo_params[2] += -dnx *     y *(1 - z) + dny * (1 - x)*(1 - z) - dnz * (1 - x)*    y;
+                    dL_dgeo_params[3] +=  dnx *     y *(1 - z) + dny *     x *(1 - z) - dnz *     x *    y;
+                    dL_dgeo_params[4] += -dnx * (1 - y)*    z - dny * (1 - x)*    z + dnz * (1 - x)*(1 - y);
+                    dL_dgeo_params[5] +=  dnx * (1 - y)*    z - dny *     x *    z + dnz *     x *(1 - y);
+                    dL_dgeo_params[6] += -dnx *     y *    z + dny * (1 - x)*    z + dnz * (1 - x)*    y;
+                    dL_dgeo_params[7] +=  dnx *     y *    z + dny *     x *    z + dnz *     x *    y;
+                }
+            }
             // Gradient from normal
-            if (need_normal)
+            if(need_normal)// (need_normal && density_mode != DENSITY_SDF)
             {
                 float N_grad_to_geo_params[8];
                 const float lin_nx = (
@@ -409,80 +647,138 @@ renderCUDA(
             /**************************
             Backprop from voxel volume integral to surface parameters.
             **************************/
-            const float dL_dI = dL_dalpha * exp_neg_vol_int;
+            if(density_mode == DENSITY_SDF)
+            {
+                float phi_entry_prime = s_val[0] * phi_entry * (1.f - phi_entry);
+                float phi_exit_prime  = s_val[0] * phi_exit  * (1.f - phi_exit);
+
+                d_alpha_d_entry = (phi_entry_prime * (1.f - alpha)) / denom;
+                d_alpha_d_exit  = -phi_exit_prime / denom;
+
+                for (int i = 0; i < 8; ++i) {
+                    dL_dgeo_params[i] += d_alpha_d_entry * interp_w_entry[i] * dL_dalpha;
+                    dL_dgeo_params[i] += d_alpha_d_exit  * interp_w_exit[i]  * dL_dalpha;
+                }
+                if (dL_ds_val != nullptr) {
+                    float d_phi_entry_ds = phi_entry * (1.f - phi_entry) * sdf_entry;
+                    float d_phi_exit_ds  = phi_exit  * (1.f - phi_exit)  * sdf_exit;
+
+                    float d_alpha_ds_val = ((d_phi_entry_ds * (1.f - alpha)) + (-d_phi_exit_ds)) / denom;
+                    float dL_ds_val_local = dL_dalpha * d_alpha_ds_val;
+
+                    atomicAdd(&dL_ds_val[0], dL_ds_val_local);
+                }
+            }
+            else{
+                const float dL_dI = dL_dalpha * exp_neg_vol_int;
 
             /**************************
             Sum up the gradient from rendering below.
             **************************/
-            for (int iii=0; iii<8; ++iii)
-                dL_dgeo_params[iii] += dL_dI * dI_dgeo_params[iii];
-
+                for (int iii=0; iii<8; ++iii)
+                    dL_dgeo_params[iii] += dL_dI * dI_dgeo_params[iii];
+            }
             // Gradient from depth
             if (need_depth)
             {
                 float dval;
                 float dLdepth_dI[n_samp];
-                if (n_samp == 3)
+                if (n_samp == 3 || n_samp == 2) 
                 {
-                    float step_sz = 0.3333333f * (b - a);
-                    float a0 = local_alphas[0], a1 = local_alphas[1], a2 = local_alphas[2];
-                    float t0 = a + 0.5f * step_sz;
-                    float t1 = a + 1.5f * step_sz;
-                    float t2 = a + 2.5f * step_sz;
-                    dval = a0*t0 + (1.f-a0)*a1*t1 + (1.f-a0)*(1.f-a1)*a2*t2;
-                    dLdepth_dI[0] = dL_dD * T * (t0 + a1*a2*t2 - a1*t1 - a2*t2) * (1.f - a0);
-                    dLdepth_dI[1] = dL_dD * T * (t1 + a0*a2*t2 - a0*t1 - a2*t2) * (1.f - a1);
-                    dLdepth_dI[2] = dL_dD * T * (t2 + a0*a1*t2 - a0*t2 - a1*t2) * (1.f - a2);
-                }
-                else if (n_samp == 2)
-                {
-                    float step_sz = 0.5f * (b - a);
-                    float a0 = local_alphas[0], a1 = local_alphas[1];
-                    float t0 = a + 0.5f * step_sz;
-                    float t1 = a + 1.5f * step_sz;
-                    dval = a0*t0 + (1.f-a0)*a1*t1;
-                    dLdepth_dI[0] = dL_dD * T * (t0 - a1*t1) * (1.f - a0);
-                    dLdepth_dI[1] = dL_dD * T * (t1 - a0*t1) * (1.f - a1);
+                    if (n_samp == 3)
+                    {
+                        float step_sz = 0.3333333f * (b - a);
+                        float a0 = local_alphas[0], a1 = local_alphas[1], a2 = local_alphas[2];
+                        float t0 = a + 0.5f * step_sz;
+                        float t1 = a + 1.5f * step_sz;
+                        float t2 = a + 2.5f * step_sz;
+                        dval = a0*t0 + (1.f-a0)*a1*t1 + (1.f-a0)*(1.f-a1)*a2*t2;
+                        if constexpr (density_mode == DENSITY_SDF) {
+                            // ∂L/∂α_k 만 필요 (∂α/∂g는 each_dI_dgeo_params에 이미 반영)
+                            dLdepth_dI[0] = dL_dD * T * (t0 + a1*a2*t2 - a1*t1 - a2*t2);          // no *(1-a0)
+                            dLdepth_dI[1] = dL_dD * T * (t1 + a0*a2*t2 - a0*t1 - a2*t2);          // no *(1-a1)
+                            dLdepth_dI[2] = dL_dD * T * (t2 + a0*a1*t2 - a0*t2 - a1*t2);          // no *(1-a2)
+                        } else {
+                            // ∂L/∂I_k 가 되어야 하므로 ∂α/∂I_k = (1 - a_k) 포함
+                            dLdepth_dI[0] = dL_dD * T * (t0 + a1*a2*t2 - a1*t1 - a2*t2) * (1.f - a0);
+                            dLdepth_dI[1] = dL_dD * T * (t1 + a0*a2*t2 - a0*t1 - a2*t2) * (1.f - a1);
+                            dLdepth_dI[2] = dL_dD * T * (t2 + a0*a1*t2 - a0*t2 - a1*t2) * (1.f - a2);
+                        }
+                    }
+                    else if (n_samp == 2)
+                    {
+                        float step_sz = 0.5f * (b - a);
+                        float a0 = local_alphas[0], a1 = local_alphas[1];
+                        float t0 = a + 0.5f * step_sz;
+                        float t1 = a + 1.5f * step_sz;
+                        dval = a0*t0 + (1.f-a0)*a1*t1;
+                        if constexpr (density_mode == DENSITY_SDF) {
+                            dLdepth_dI[0] = dL_dD * T * (t0 - a1*t1);                  // no *(1-a0)
+                            dLdepth_dI[1] = dL_dD * T * (t1 - a0*t1);                  // no *(1-a1)
+                        } else {
+                            dLdepth_dI[0] = dL_dD * T * (t0 - a1*t1) * (1.f - a0);
+                            dLdepth_dI[1] = dL_dD * T * (t1 - a0*t1) * (1.f - a1);
+                        }    
+                    }
                 }
                 else
                 {
                     float t0 = 0.5f * (a + b);
                     dval = alpha * t0;
-                    dLdepth_dI[0] = dL_dD * T * t0 * (1.f - alpha);
+                    if constexpr (density_mode == DENSITY_SDF) {
+                        // ∂L/∂α 로 사용 (entry/exit에서 ∂α/∂g 직접 곱해줌)
+                        dLdepth_dI[0] = dL_dD * T * t0;                        // no *(1 - alpha)
+                    } else {
+                        // ∂L/∂I 로 사용
+                        dLdepth_dI[0] = dL_dD * T * t0 * (1.f - alpha);
+                    }
                 }
 
                 last_dL_dT += dL_dD * dval;
 
-                if (n_samp == 3)
+                if ((n_samp == 3 || n_samp == 2) )
                 {
-                    for (int iii=0; iii<8; ++iii)
-                        dL_dgeo_params[iii] += dLdepth_dI[0] * each_dI_dgeo_params[0][iii] + \
-                                            dLdepth_dI[1] * each_dI_dgeo_params[1][iii] + \
-                                            dLdepth_dI[2] * each_dI_dgeo_params[2][iii];
-                }
-                else if (n_samp == 2)
-                {
-                    for (int iii=0; iii<8; ++iii)
-                        dL_dgeo_params[iii] += dLdepth_dI[0] * each_dI_dgeo_params[0][iii] + \
-                                            dLdepth_dI[1] * each_dI_dgeo_params[1][iii];
+                    if (n_samp == 3)
+                    {
+                        for (int iii=0; iii<8; ++iii)
+                            dL_dgeo_params[iii] += dLdepth_dI[0] * each_dI_dgeo_params[0][iii] + \
+                                                dLdepth_dI[1] * each_dI_dgeo_params[1][iii] + \
+                                                dLdepth_dI[2] * each_dI_dgeo_params[2][iii];
+                    }
+                    else if (n_samp == 2)
+                    {
+                        for (int iii=0; iii<8; ++iii)
+                            dL_dgeo_params[iii] += dLdepth_dI[0] * each_dI_dgeo_params[0][iii] + \
+                                                dLdepth_dI[1] * each_dI_dgeo_params[1][iii];
+                    }
                 }
                 else
                 {
-                    for (int iii=0; iii<8; ++iii)
-                        dL_dgeo_params[iii] += dLdepth_dI[0] * dI_dgeo_params[iii];
+                    if (density_mode == DENSITY_SDF) {
+                        // dLdepth_dI[0]는 dL/d(alpha) 역할
+                        for (int i=0; i<8; ++i) {
+                            dL_dgeo_params[i] += dLdepth_dI[0] * ( d_alpha_d_entry * interp_w_entry[i]
+                                                                + d_alpha_d_exit  * interp_w_exit[i] );
+                        }
+                    } else{
+                        for (int iii=0; iii<8; ++iii)
+                            dL_dgeo_params[iii] += dLdepth_dI[0] * dI_dgeo_params[iii];
+                    }
                 }
             }
 
             if (lambda_ascending > 0)
             {
+                
                 const float3 pt_a = ro + a * rd;
                 const float3 qt_a = (pt_a - (vox_c - 0.5f * vox_l)) * vox_l_inv;
                 const float3 pt_b = ro + b * rd;
                 const float3 qt_b = (pt_b - (vox_c - 0.5f * vox_l)) * vox_l_inv;
-
+                    
                 float interp_w_a[8], interp_w_b[8];
                 tri_interp_weight(qt_a, interp_w_a);
                 tri_interp_weight(qt_b, interp_w_b);
+                
 
                 float d_a = 0.f, d_b = 0.f;
                 for (int iii=0; iii<8; ++iii)
@@ -490,11 +786,36 @@ renderCUDA(
                     d_a += geo_params[iii] * interp_w_a[iii];
                     d_b += geo_params[iii] * interp_w_b[iii];
                 }
+                /*
+                if (density_mode == DENSITY_SDF) {
+                    // descending: L = max(0, d_b - d_a)
+                    const float reg_w = weight_ascending * static_cast<float>(d_b > d_a);
+                    for (int iii = 0; iii < 8; ++iii)
+                        dL_dgeo_params[iii] += reg_w * (interp_w_b[iii] - interp_w_a[iii]);
+                } else {
+                    // original ascending: L = max(0, d_a - d_b)
+                    const float reg_w = weight_ascending * pt_w * static_cast<float>(d_a > d_b);
+                    for (int iii = 0; iii < 8; ++iii)
+                        dL_dgeo_params[iii] += reg_w * (interp_w_a[iii] - interp_w_b[iii]);
+                }*/
+                float s = (b - a);          // rd가 unit이 아니면 length(rd) 필요
+                s = fmaxf(s, 1e-6f);                     // 분모 안정화
+                const float inv_s = 1.f / s;
 
-                // L = max(0, d_a - d_b)
-                const float reg_w = weight_ascending * pt_w * static_cast<float>(d_a > d_b);
-                for (int iii=0; iii<8; ++iii)
-                    dL_dgeo_params[iii] += reg_w * (interp_w_a[iii] - interp_w_b[iii]);
+                const float delta = d_b - d_a;           // (이미 위에서 계산되어 있어야 함)
+
+                // 게이팅/가중(그대로)
+                //if (T < 0.5f) continue;
+                const float reg_w = weight_ascending *pt_w;
+
+                // dL/d(delta) = 2 * (delta/s + 2) * (1/s)
+                const float g = 2.f * reg_w * ((delta * inv_s) + 2.f) * inv_s;
+
+                // 코너별 기여(그대로)
+                #pragma unroll
+                for (int iii = 0; iii < 8; ++iii) {
+                    dL_dgeo_params[iii] += g * (interp_w_b[iii] - interp_w_a[iii]);
+                }
             }
 
             /**************************
@@ -531,39 +852,39 @@ renderCUDA(
 
 #ifndef BwRendFunc
 // Dirty trick. The argument name must be aligned with BACKWARD::render.
-#define BwRendFunc(...) \
+#define BwRendFunc(n_samp, density_mode) \
     ( \
         (need_depth && need_distortion && need_normal) ?\
-            renderCUDA<true, true, true, __VA_ARGS__> :\
+            renderCUDA<true, true, true, n_samp, density_mode> :\
         (need_depth && need_distortion && !need_normal) ?\
-            renderCUDA<true, true, false, __VA_ARGS__> :\
+            renderCUDA<true, true, false, n_samp, density_mode> :\
         (need_depth && !need_distortion && need_normal) ?\
-            renderCUDA<true, false, true, __VA_ARGS__> :\
+            renderCUDA<true, false, true, n_samp, density_mode> :\
         (need_depth && !need_distortion && !need_normal) ?\
-            renderCUDA<true, false, false, __VA_ARGS__> :\
+            renderCUDA<true, false, false, n_samp, density_mode> :\
         (!need_depth && need_distortion && need_normal) ?\
-            renderCUDA<false, true, true, __VA_ARGS__> :\
+            renderCUDA<false, true, true, n_samp, density_mode> :\
         (!need_depth && need_distortion && !need_normal) ?\
-            renderCUDA<false, true, false, __VA_ARGS__> :\
+            renderCUDA<false, true, false, n_samp, density_mode> :\
         (!need_depth && !need_distortion && need_normal) ?\
-            renderCUDA<false, false, true, __VA_ARGS__> :\
+            renderCUDA<false, false, true, n_samp, density_mode> :\
         (!need_depth && !need_distortion && !need_normal) ?\
-            renderCUDA<false, false, false, __VA_ARGS__> :\
+            renderCUDA<false, false, false, n_samp, density_mode> :\
         (need_depth && need_distortion && need_normal) ?\
-            renderCUDA<true, true, true, __VA_ARGS__> :\
+            renderCUDA<true, true, true, n_samp, density_mode> :\
         (need_depth && need_distortion && !need_normal) ?\
-            renderCUDA<true, true, false, __VA_ARGS__> :\
+            renderCUDA<true, true, false, n_samp, density_mode> :\
         (need_depth && !need_distortion && need_normal) ?\
-            renderCUDA<true, false, true, __VA_ARGS__> :\
+            renderCUDA<true, false, true, n_samp, density_mode> :\
         (need_depth && !need_distortion && !need_normal) ?\
-            renderCUDA<true, false, false, __VA_ARGS__> :\
+            renderCUDA<true, false, false, n_samp, density_mode> :\
         (!need_depth && need_distortion && need_normal) ?\
-            renderCUDA<false, true, true, __VA_ARGS__> :\
+            renderCUDA<false, true, true, n_samp, density_mode> :\
         (!need_depth && need_distortion && !need_normal) ?\
-            renderCUDA<false, true, false, __VA_ARGS__> :\
+            renderCUDA<false, true, false, n_samp, density_mode> :\
         (!need_depth && !need_distortion && need_normal) ?\
-            renderCUDA<false, false, true, __VA_ARGS__> :\
-            renderCUDA<false, false, false, __VA_ARGS__> \
+            renderCUDA<false, false, true ,n_samp, density_mode> :\
+            renderCUDA<false, false, false, n_samp, density_mode> \
     )
 #endif
 
@@ -572,12 +893,13 @@ void render(
     const dim3 tile_grid, const dim3 block,
     const uint2* ranges,
     const uint32_t* vox_list,
-    const int n_samp_per_vox,
+    const int vox_geo_mode,
+    const int density_mode,
     const int W, const int H,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const float* c2w_matrix,
-    const float bg_color,
+    const float3* background,
 
     const uint2* bboxes,
     const float3* vox_centers,
@@ -602,18 +924,26 @@ void render(
     const bool need_normal,
     const float* out_D,
     const float* out_N,
-
-    float* dL_dvox)
+    const float* s_val,
+    const float* sdf0_buffer,
+    float* dL_dvox,
+    float* dL_ds_val)
 {
     const bool need_distortion = (lambda_dist > 0);
 
     // The density_mode now is always EXP_LINEAR_11_MODE
     const auto kernel_func =
-        (n_samp_per_vox == 3) ?
-            BwRendFunc(3) :
-        (n_samp_per_vox == 2) ?
-            BwRendFunc(2) :
-            BwRendFunc(1) ;
+    (density_mode == DENSITY_EXP_LINEAR_11) ?
+        (
+            (vox_geo_mode == VOX_TRIINTERP1_MODE) ?
+                BwRendFunc(1, DENSITY_EXP_LINEAR_11) :
+            (vox_geo_mode == VOX_TRIINTERP3_MODE) ?
+                BwRendFunc(3, DENSITY_EXP_LINEAR_11) :
+                BwRendFunc(2, DENSITY_EXP_LINEAR_11)
+        ) :
+    (density_mode == DENSITY_SDF) ?
+        BwRendFunc(3, DENSITY_SDF):
+        BwRendFunc(3, DENSITY_SDF); //������ �̷���
 
     kernel_func <<<tile_grid, block>>> (
         ranges,
@@ -622,7 +952,7 @@ void render(
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix,
-        bg_color,
+        background,
 
         bboxes,
         vox_centers,
@@ -645,22 +975,25 @@ void render(
         lambda_dist,
         out_D,
         out_N,
-
-        dL_dvox);
+        s_val,
+        sdf0_buffer,
+        dL_dvox,
+        dL_ds_val);
 }
 
 
 // Interface for python to run backward pass of voxel rasterization.
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 rasterize_voxels_backward(
     const int R,
-    const int n_samp_per_vox,
+    const int vox_geo_mode,
+    const int density_mode,
     const int image_width, const int image_height,
     const float tan_fovx, const float tan_fovy,
     const float cx, const float cy,
     const torch::Tensor& w2c_matrix,
     const torch::Tensor& c2w_matrix,
-    const float bg_color,
+    const torch::Tensor& background,
 
     const torch::Tensor& octree_paths,
     const torch::Tensor& vox_centers,
@@ -687,7 +1020,9 @@ rasterize_voxels_backward(
     const torch::Tensor& out_D,
     const torch::Tensor& out_N,
 
-    const bool debug)
+    const bool debug,
+    const torch::Tensor& s_val,
+    const torch::Tensor& sdf0_buffer)
 {
     if (vox_centers.ndimension() != 2 || vox_centers.size(1) != 3)
         AT_ERROR("vox_centers must have dimensions (num_points, 3)");
@@ -699,10 +1034,12 @@ rasterize_voxels_backward(
         torch::Tensor dL_dgeos = torch::empty({0});
         torch::Tensor dL_drgbs = torch::empty({0});
         torch::Tensor subdiv_p_bw = torch::empty({0});
-        return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw);
+        torch::Tensor dL_ds_val = torch::empty({0});
+        return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_ds_val);
     }
 
     torch::Tensor dL_dvox = torch::zeros({P, geos.size(1)+3+1}, vox_centers.options());
+    torch::Tensor dL_ds_val = torch::zeros({1}, s_val.options());
     dim3 tile_grid((image_width + BLOCK_X - 1) / BLOCK_X, (image_height + BLOCK_Y - 1) / BLOCK_Y, 1);
     dim3 block(BLOCK_X, BLOCK_Y, 1);
 
@@ -726,12 +1063,13 @@ rasterize_voxels_backward(
         tile_grid, block,
         imgState.ranges,
         binningState.vox_list,
-        n_samp_per_vox,
+        vox_geo_mode,
+        density_mode,
         image_width, image_height,
         tan_fovx, tan_fovy,
         cx, cy,
         c2w_matrix.contiguous().data_ptr<float>(),
-        bg_color,
+        (float3*)(background.contiguous().data_ptr<float>()),
 
         geomState.bboxes,
         (float3*)(vox_centers.contiguous().data_ptr<float>()),
@@ -756,16 +1094,18 @@ rasterize_voxels_backward(
         need_normal,
         out_D.contiguous().data_ptr<float>(),
         out_N.contiguous().data_ptr<float>(),
-
-        dL_dvox.contiguous().data_ptr<float>());
+        s_val.contiguous().data_ptr<float>(),
+        sdf0_buffer.contiguous().data_ptr<float>(),
+        dL_dvox.contiguous().data_ptr<float>(),
+        dL_ds_val.contiguous().data_ptr<float>());
     CHECK_CUDA(debug);
 
     std::vector<torch::Tensor> gradient_lst = dL_dvox.split({geos.size(1), 3, 1}, 1);
-    torch::Tensor dL_dgeos = gradient_lst[0].contiguous();
-    torch::Tensor dL_drgbs = gradient_lst[1].contiguous();
-    torch::Tensor subdiv_p_bw = gradient_lst[2].contiguous();
+    torch::Tensor dL_dgeos = gradient_lst[0];
+    torch::Tensor dL_drgbs = gradient_lst[1];
+    torch::Tensor subdiv_p_bw = gradient_lst[2];
 
-    return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw);
+    return std::make_tuple(dL_dgeos, dL_drgbs, subdiv_p_bw, dL_ds_val);
 }
 
 }

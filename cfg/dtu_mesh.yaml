@@ -9,24 +9,26 @@
 # See `src/config.py` for the base setup.
 data:
   eval: False
-  skip_blend_alpha: True
+  blend_mask: False
   res_downscale: 2.0
 
-bounding:
-  outside_level: 1
-
 model:
-  n_samp_per_vox: 3
+  outside_level: 1
+  vox_geo_mode: triinterp3
   black_background: True
 
 optimizer:
   geo_lr: 0.05
 
+bounding:
+  bound_scale: 1.0
+
 regularizer:
-  lambda_T_concen: 0.01
-  lambda_R_concen: 0.1
+  lambda_T_concen: 0.01 #0.01
+  lambda_R_concen: 0.1 #0.1
   lambda_normal_dmean: 0.001
   lambda_normal_dmed: 0.001
-
+procedure:
+  subdivide_all_until: 0
 init:
-  init_out_ratio: 0.01  # Use very few voxels for the mostly black background
+  outside_mode: uniform3

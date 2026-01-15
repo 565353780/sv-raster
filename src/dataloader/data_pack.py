@@ -7,120 +7,101 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 import os
-import time
 import random
 import numpy as np
-
+from PIL import Image
 import torch
-
+import torch.nn.functional as F
 from src.dataloader.reader_colmap_dataset import read_colmap_dataset
-from src.utils.camera_utils import interpolate_poses
+from src.dataloader.reader_nerf_dataset import read_nerf_dataset
 
 from src.cameras import Camera, MiniCam
 
+AUTO_MAX_N_PIXELS = 1024 ** 2
+AUTO_WARN = False
 
 class DataPack:
 
-    def __init__(self,
-                 source_path,
-                 image_dir_name="images",
-                 mask_dir_name="masks",
-                 res_downscale=0.,
-                 res_width=0,
-                 skip_blend_alpha=False,
-                 alpha_is_white=False,
-                 data_device="cpu",
-                 use_test=False,
-                 test_every=8,
-                 camera_params_only=False):
+    def __init__(self, cfg_data, white_background=False, dataset_downscales=[1.0], camera_params_only=False):
 
-        camera_creator = CameraCreator(
-            res_downscale=res_downscale,
-            res_width=res_width,
-            skip_blend_alpha=skip_blend_alpha,
-            alpha_is_white=alpha_is_white,
-            data_device=data_device,
-            camera_params_only=camera_params_only,
-        )
+        self._cameras = dict(train={}, test={})
 
-        sparse_path = os.path.join(source_path, "sparse")
-        colmap_path = os.path.join(source_path, "colmap", "sparse")
-
-        # Read images concurrently
-        s_time = time.perf_counter()
+        sparse_path = os.path.join(cfg_data.source_path, "sparse")
+        colmap_path = os.path.join(cfg_data.source_path, "colmap", "sparse")
+        meta_path1 = os.path.join(cfg_data.source_path, "transforms_train.json")
+        meta_path2 = os.path.join(cfg_data.source_path, "transforms.json")
 
         if os.path.exists(sparse_path) or os.path.exists(colmap_path):
             print("Read dataset in COLMAP format.")
-            dataset = read_colmap_dataset(
-                source_path=source_path,
-                image_dir_name=image_dir_name,
-                mask_dir_name=mask_dir_name,
-                camera_creator=camera_creator)
+            scene_info = read_colmap_dataset(
+                path=cfg_data.source_path,
+                images=cfg_data.images,
+                depth_paths=cfg_data.depth_paths,
+                normal_paths=cfg_data.normal_paths,
+                test_every=cfg_data.test_every,
+                eval=cfg_data.eval)
+        elif os.path.exists(meta_path1) or os.path.exists(meta_path2):
+            print("Read dataset in NeRF format.")
+            scene_info = read_nerf_dataset(
+                path=cfg_data.source_path,
+                extension=cfg_data.extension,
+                test_every=cfg_data.test_every,
+                eval=cfg_data.eval)
         else:
             raise Exception("Unknown scene type!")
 
-        e_time = time.perf_counter()
-        print(f"Read dataset in {e_time - s_time:.3f} seconds.")
+        print(f"res_downscale={cfg_data.res_downscale}")
+        print(f"res_width={cfg_data.res_width}")
+        if camera_params_only:
+            self._cameras['train'][1.0] = CameraList(
+                scene_info.train_cam_infos, cfg_data, camera_params_only=True)
+            self._cameras['test'][1.0] = CameraList(
+                scene_info.test_cam_infos, cfg_data, camera_params_only=True)
+        else:
+            for dataset_downscale in dataset_downscales:
+                self._cameras['train'][dataset_downscale] = CameraList(
+                    scene_info.train_cam_infos, cfg_data, dataset_downscale)
+                self._cameras['test'][dataset_downscale] = CameraList(
+                    scene_info.test_cam_infos, cfg_data, dataset_downscale)
 
-        self._cameras = {
-            'train': dataset['train_cam_lst'],
-            'test': dataset['test_cam_lst'],
-        }
+        self.has_depth = False
+        self.has_mask = False
+        self.has_normal = False
+        self.has_conf = False
+        for cams_split in self._cameras.values():
+            for cams in cams_split.values():
+                for cam in cams:
+                    self.has_depth |= cam.depth is not None
+                    self.has_mask |= cam.mask is not None
+                    self.has_normal |= cam.normal is not None
+                    self.has_conf |= cam.conf is not None
 
-        ##############################
-        # Read additional dataset info
-        ##############################
-        # If the dataset suggested a scene bound
-        self.suggested_bounding = dataset.get('suggested_bounding', None)
+        if self.has_mask and cfg_data.blend_mask:
+            bg_color = torch.tensor([float(white_background)]*3, dtype=torch.float32)
+            self.composite_bg_color(bg_color)
 
-        # If the dataset provide a transformation to other coordinate
+        self.suggested_bounding = scene_info.suggested_bounding
+
         self.to_world_matrix = None
-        to_world_path = os.path.join(source_path, 'to_world_matrix.txt')
+        to_world_path = os.path.join(cfg_data.source_path, 'to_world_matrix.txt')
         if os.path.isfile(to_world_path):
             self.to_world_matrix = np.loadtxt(to_world_path)
 
-        # If the dataset has a point cloud
-        self.point_cloud = dataset.get('point_cloud', None)
+        self.point_cloud = scene_info.point_cloud
+        self.sfm_init_data = scene_info.sfm_init_data
+    def get_train_cameras(self, scale=1.0):
+        return self._cameras['train'][scale]
 
-    def get_train_cameras(self):
-        return self._cameras['train']
+    def get_test_cameras(self, scale=1.0):
+        return self._cameras['test'][scale]
 
-    def get_test_cameras(self):
-        return self._cameras['test']
-
-    def interpolate_cameras(self, n_frames, starting_id=0, ids=[], step_forward=0):
-        cams = self.get_train_cameras()
-        if len(ids):
-            key_poses = [cams[i].c2w.cpu().numpy() for i in ids]
-        else:
-            assert starting_id >= 0
-            assert starting_id < len(cams)
-            cam_pos = torch.stack([cam.position for cam in cams])
-            ids = [starting_id]
-            for _ in range(3):
-                farthest_id = torch.cdist(cam_pos[ids], cam_pos).amin(0).argmax().item()
-                ids.append(farthest_id)
-            ids[1], ids[2] = ids[2], ids[1]
-            key_poses = [cams[i].c2w.cpu().numpy() for i in ids]
-
-        if step_forward != 0:
-            for i in range(len(key_poses)):
-                lookat = key_poses[i][:3, 2]
-                key_poses[i][:3, 3] += step_forward * lookat
-
-        interp_poses = interpolate_poses(key_poses, n_frame=n_frames, periodic=True)
-
-        base_cam = cams[ids[0]]
-        interp_cams = [
-            MiniCam(
-                c2w=pose,
-                fovx=base_cam.fovx, fovy=base_cam.fovy,
-                width=base_cam.image_width, height=base_cam.image_height)
-            for pose in interp_poses]
-        return interp_cams
+    def composite_bg_color(self, bg_color):
+        for cams_split in self._cameras.values():
+            for cams in cams_split.values():
+                for cam in cams:
+                    cam.composite_bg_color(bg_color)
 
 
-# Create a random sequence of image indices
 def compute_iter_idx(num_data, num_iter):
     tr_iter_idx = []
     while len(tr_iter_idx) < num_iter:
@@ -129,92 +110,143 @@ def compute_iter_idx(num_data, num_iter):
         tr_iter_idx.extend(lst)
     return tr_iter_idx[:num_iter]
 
+def compute_iter_idx_sparse(num_data, num_iter, skip_num=1):
+    tr_iter_idx = []
+    while len(tr_iter_idx) < num_iter:
+        lst = list(range(0, num_data, skip_num))
+        random.shuffle(lst)
+        tr_iter_idx.extend(lst)
+    return tr_iter_idx[:num_iter]
 
-# Function that create Camera instances while parsing dataset
-class CameraCreator:
 
-    warned = False
-
-    def __init__(self,
-                 res_downscale=0.,
-                 res_width=0,
-                 skip_blend_alpha=False,
-                 alpha_is_white=False,
-                 data_device="cpu",
-                 camera_params_only=False):
-
-        self.res_downscale = res_downscale
-        self.res_width = res_width
-        self.skip_blend_alpha = skip_blend_alpha
-        self.alpha_is_white = alpha_is_white
-        self.data_device = data_device
-        self.camera_params_only = camera_params_only
-
-    def __call__(self,
-                 image,
-                 w2c,
-                 fovx,
-                 fovy,
-                 cx_p=0.5,
-                 cy_p=0.5,
-                 sparse_pt=None,
-                 image_name="",
-                 mask=None):
-
-        # Determine target resolution
-        if self.res_downscale > 0:
-            downscale = self.res_downscale
-        elif self.res_width > 0:
-            downscale = image.size[0] / self.res_width
+class CameraList:
+    def __init__(self, cam_infos, cfg_data, dataset_downscale=1.0, camera_params_only=False):
+        if camera_params_only:
+            self.camera_list = [
+                instantiate_a_minicamera(cam_info, cfg_data, dataset_downscale)
+                for cam_info in cam_infos
+            ]
         else:
-            downscale = 1
+            self.camera_list = [
+                instantiate_a_camera(cam_info, cfg_data, dataset_downscale)
+                for cam_info in cam_infos
+            ]
+            for i in range(len(cam_infos)):
+                self.camera_list[i] = self.camera_list[i].to(cfg_data.data_device)
 
-            total_pix = image.size[0] * image.size[1]
-            if total_pix > 1200 ** 2 and not self.warned:
-                self.warned = True
-                suggest_ds = (total_pix ** 0.5) / 1200
-                print(f"###################################################################")
-                print(f"Image too large. Suggest to use `--res_downscale {suggest_ds:.1f}`.")
-                print(f"###################################################################")
+    def __len__(self):
+        return len(self.camera_list)
 
-        # Load camera parameters only
-        if self.camera_params_only:
-            return MiniCam(
-                c2w=np.linalg.inv(w2c),
-                fovx=fovx, fovy=fovy,
-                cx_p=cx_p, cy_p=cy_p,
-                width=round(image.size[0] / downscale),
-                height=round(image.size[1] / downscale),
-                image_name=image_name)
+    def __getitem__(self, idx):
+        return self.camera_list[idx]
 
-        # Resize image if needed
-        if downscale != 1:
-            size = (round(image.size[0] / downscale), round(image.size[1] / downscale))
-            image = image.resize(size)
 
-        # Convert image to tensor
-        tensor = torch.tensor(np.array(image), dtype=torch.float32).moveaxis(-1, 0) / 255.0
-        if tensor.shape[0] == 4:
-            # Blend alpha channel
-            tensor, mask = tensor.split([3, 1], dim=0)
-            if not self.skip_blend_alpha:
-                tensor = tensor * mask + int(self.alpha_is_white) * (1 - mask)
+def instantiate_a_camera(cam_info, cfg_data, dataset_downscale):
+    # Determine target resolution
+    W, H = cam_info.image.size
+    if cfg_data.res_downscale > 0:
+        global_downscale = cfg_data.res_downscale
+    elif cfg_data.res_width > 0:
+        global_downscale = W / cfg_data.res_width
+    elif W * H > AUTO_MAX_N_PIXELS and cfg_data.images == "images":
+        global_downscale = (AUTO_MAX_N_PIXELS / (W * H)) ** -0.5
+        global AUTO_WARN
+        if not AUTO_WARN:
+            AUTO_WARN = True
+            print(f"[WARN] Source images are too large ({W}x{H}). ")
+            print(f"       Auto downscale gt by {global_downscale}. ")
+            print(f"       Use `--images`, `--res_downscale`, or `--res_width` to prevent it.")
+    else:
+        global_downscale = 1
 
-        # Conver mask to tensor if there is
+    target_downscale = float(global_downscale * dataset_downscale)
+    target_resolution = (round(W / target_downscale), round(H / target_downscale))
+
+    # Resize image if needed
+    if (W, H) != target_resolution:
+        pil_image = cam_info.image.resize(target_resolution)
+    else:
+        pil_image = cam_info.image
+
+    # Read color image
+    gt_image = torch.tensor(np.array(pil_image), dtype=torch.float32).moveaxis(-1, 0) / 255.0
+    mask = None
+    if gt_image.shape[0] == 4:
+        gt_image, mask = gt_image.split([3, 1], dim=0)
+
+    # Load mask if exist
+    if cam_info.mask is not None:
         if mask is not None:
-            size = tensor.shape[-2:][::-1]
-            if mask.size != size:
-                mask = mask.resize(size)
-            mask = torch.tensor(np.array(mask), dtype=torch.float32) / 255.0
-            if len(mask.shape) == 3:
-                mask = mask.mean(-1)
-            mask = mask[None]
+            raise NotImplementedError("Duplicated mask from RGBA and given mask path !?")
+        if cam_info.mask.size != target_resolution:
+            pil_mask = cam_info.mask.resize(target_resolution)
+        else:
+            pil_mask = cam_info.mask
+        mask = torch.tensor(np.array(pil_mask), dtype=torch.float32) / 255.0
+        if len(mask.shape) == 3:
+            mask = mask.mean(-1)
+        mask = mask.unsqueeze(0).contiguous()
 
-        return Camera(
-            w2c=w2c,
-            fovx=fovx, fovy=fovy,
-            cx_p=cx_p, cy_p=cy_p,
-            image=tensor,
-            mask=mask,
-            sparse_pt=sparse_pt,
-            image_name=image_name)
+    # Load depth if exist
+    depth = None
+    if cam_info.depth is not None:
+        if cam_info.depth.size != target_resolution:
+            pil_depth = cam_info.depth.resize(target_resolution, Image.Resampling.NEAREST)
+        else:
+            pil_depth = cam_info.depth
+        depth = torch.tensor(np.array(pil_depth) / cfg_data.depth_scale, dtype=torch.float32)
+        depth = depth.unsqueeze(0).contiguous()
+    normal = None
+    if cam_info.normal is not None:
+        if cam_info.normal.size != target_resolution:
+            pil_normal = cam_info.normal.resize(target_resolution, Image.Resampling.BILINEAR)
+        else:
+            pil_normal = cam_info.normal
+
+        n = np.asarray(pil_normal, dtype=np.float32) / 255.0     # [H,W,3] in [0,1]
+        n = n * 2.0 - 1.0                                        # → [-1,1]
+        n = np.nan_to_num(n, nan=0.0, posinf=0.0, neginf=0.0)
+
+        R_wc = cam_info.w2c[:3, :3].T.astype(np.float32)         # [3,3]
+        R_wc_t = torch.from_numpy(R_wc)                           # torch [3,3]
+
+        normal_cam = torch.from_numpy(n).permute(2,0,1).contiguous().float()  # [3,H,W]
+        normal_world = torch.einsum('ij,jhw->ihw', R_wc_t, normal_cam)        # [3,H,W]
+
+        normal = F.normalize(normal_world, dim=0, eps=1e-8)
+
+    return Camera(w2c=cam_info.w2c,
+                  fovx=cam_info.fovx, fovy=cam_info.fovy,
+                  cx_p=cam_info.cx_p, cy_p=cam_info.cy_p,
+                  image=gt_image, mask=mask, depth=depth, normal=normal,
+                  sparse_pt=cam_info.sparse_pt,
+                  image_name=cam_info.image_name)
+
+
+def instantiate_a_minicamera(cam_info, cfg_data, dataset_downscale=1):
+    # Determine target resolution
+    W, H = cam_info.image.size
+    if cfg_data.res_downscale > 0:
+        global_downscale = cfg_data.res_downscale
+    elif cfg_data.res_width > 0:
+        global_downscale = W / cfg_data.res_width
+    elif W * H > AUTO_MAX_N_PIXELS and cfg_data.images == "images":
+        global_downscale = (AUTO_MAX_N_PIXELS / (W * H)) ** -0.5
+        global AUTO_WARN
+        if not AUTO_WARN:
+            AUTO_WARN = True
+            print(f"[WARN] Auto downscale gt by {global_downscale}. ")
+            print(f"       Use `--res_downscale` or `--res_width` to prevent it.")
+    else:
+        global_downscale = 1
+
+    target_downscale = float(global_downscale * dataset_downscale)
+    target_resolution = (round(W / target_downscale), round(H / target_downscale))
+
+    return MiniCam(
+        c2w=np.linalg.inv(cam_info.w2c),
+        fovx=cam_info.fovx,
+        fovy=cam_info.fovy,
+        width=target_resolution[0],
+        height=target_resolution[1],
+        cx_p=cam_info.cx_p, cy_p=cam_info.cy_p)
