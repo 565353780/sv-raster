@@ -1,6 +1,7 @@
 import os
 import cv2
 import torch
+import trimesh
 import numpy as np
 from tqdm import tqdm
 from copy import deepcopy
@@ -22,43 +23,6 @@ from sv_raster.Data.colmap_camera import ColmapCamera
 from sv_raster.Method.io import loadMeshFile
 from sv_raster.Method.path import createFileFolder
 from sv_raster.Model.sparse_voxel import SparseVoxelModel
-
-import trimesh
-
-
-def demo():
-    octree_builder = OctreeBuilder(
-        mesh_file_path,
-        depth_max=8,
-        focus_center=[0, 0, 0],
-        focus_length=1.0,
-        normalize_scale=0.99,
-        output_info=True,
-    )
-
-    leaf_num = octree_builder.leafNum
-    shape_code = octree_builder.getShapeCode()
-
-    print("shape leaf num:", leaf_num)
-    print("shape code size:", len(shape_code))
-
-    octree_builder.loadShapeCode(shape_code)
-
-    leaf_num = octree_builder.leafNum
-    shape_code = octree_builder.getShapeCode()
-
-    print("shape leaf num:", leaf_num)
-    print("shape code size:", len(shape_code))
-
-    octree_builder.renderLeaf()
-
-    for depth in range(1, depth_max + 1):
-        octree_builder.renderDepth(depth)
-
-    occ = octree_builder.getDepthOcc(8)
-    print("occ shape:", occ.shape)
-    octree_builder.renderDepthOcc(8)
-    return True
 
 
 class Trainer:
